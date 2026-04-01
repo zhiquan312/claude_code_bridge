@@ -84,6 +84,11 @@ def _find_ccb_config_root(start_dir: Path) -> Path | None:
 
     Walking upward ensures that calls from any subdirectory inside a project
     resolve to the same canonical project root.
+
+    The user's home directory is excluded: ``~/.ccb`` is CCB runtime state,
+    not a project anchor.  Without this guard, every directory under ``$HOME``
+    that lacks its own ``.ccb/`` would collapse to the home directory,
+    causing cross-project routing collisions.
     """
     try:
         current = Path(start_dir).expanduser().absolute()
@@ -91,7 +96,15 @@ def _find_ccb_config_root(start_dir: Path) -> Path | None:
         current = Path.cwd()
 
     try:
+        home = Path.home()
+    except Exception:
+        home = None
+
+    try:
         for directory in [current, *current.parents]:
+            # Skip $HOME — ~/.ccb is runtime state, not a project anchor.
+            if home is not None and directory == home:
+                continue
             if (directory / ".ccb").is_dir():
                 return directory
             if (directory / ".ccb_config").is_dir():

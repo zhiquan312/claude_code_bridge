@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from pane_registry import load_registry_by_claude_pane, load_registry_by_project_id, load_registry_by_session_id
-from project_id import compute_ccb_project_id
+from project_id import compute_ccb_project_id, find_project_root
 from session_utils import find_project_session_file, resolve_project_config_dir
 
 
@@ -246,7 +246,9 @@ def resolve_claude_session(work_dir: Path) -> Optional[ClaudeSessionResolution]:
         current_pid = compute_ccb_project_id(work_dir)
     except Exception:
         current_pid = ""
-    strict_project = resolve_project_config_dir(work_dir).is_dir()
+    # Use ancestor-aware project root so subdirectories resolve correctly.
+    project_root = find_project_root(work_dir)
+    strict_project = resolve_project_config_dir(project_root).is_dir()
     allow_cross = os.environ.get("CCB_ALLOW_CROSS_PROJECT_SESSION") in ("1", "true", "yes")
     if not strict_project and not allow_cross:
         return None
