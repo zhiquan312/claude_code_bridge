@@ -101,18 +101,25 @@ def resolve_work_dir_with_registry(
             default_cwd=default_cwd,
         )
 
-    # Try to get work_dir from unified askd daemon state
+    # Prefer caller's cwd first — prevents cross-project routing
+    cwd = default_cwd or Path.cwd()
+    try:
+        found = find_project_session_file(cwd, spec.session_filename)
+        if found:
+            return cwd, found
+    except Exception:
+        pass
+
+    # Fallback: try daemon's work_dir only if cwd had no session
     from askd_runtime import get_daemon_work_dir
     daemon_work_dir = get_daemon_work_dir("askd.json")
-    if daemon_work_dir and daemon_work_dir.exists():
+    if daemon_work_dir and daemon_work_dir.exists() and str(daemon_work_dir) != str(cwd):
         try:
             found = find_project_session_file(daemon_work_dir, spec.session_filename)
             if found:
                 return daemon_work_dir, found
         except Exception:
             pass
-
-    cwd = default_cwd or Path.cwd()
     try:
         project_id = compute_ccb_project_id(cwd)
     except Exception:

@@ -156,7 +156,20 @@ class CodexProjectSession:
                     except Exception as exc:
                         last_err = f"{exc}"
                 if last_err:
-                    return False, f"Pane not alive and respawn failed: {last_err}"
+                    # Fallback: create a brand new pane via backend API
+                    create_fn = getattr(backend, "create_pane", None)
+                    if start_cmd and callable(create_fn):
+                        try:
+                            new_pane = create_fn(cmd=start_cmd, cwd=self.work_dir)
+                            if new_pane and backend.is_alive(new_pane):
+                                self.data["pane_id"] = new_pane
+                                self.data["updated_at"] = _now_str()
+                                self._write_back()
+                                self._attach_pane_log(backend, new_pane)
+                                return True, new_pane
+                        except Exception as fallback_err:
+                            last_err = f"respawn + create_pane both failed: {fallback_err}"
+                    return False, f"Pane not alive and recovery failed: {last_err}"
 
         return False, f"Pane not alive: {pane_id}"
 

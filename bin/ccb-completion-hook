@@ -520,6 +520,8 @@ def main() -> int:
         return 1
 
     if caller == "manual":
+        # Log manual completion for observability, but don't attempt terminal delivery
+        print(f"[completion-hook] manual caller completion for provider={provider}, no delivery attempted", file=sys.stderr)
         return 0
 
     # Terminal caller - construct notification message

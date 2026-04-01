@@ -16,7 +16,10 @@ from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderRes
 from askd.registry import ProviderRegistry
 from askd_runtime import log_path, random_token, state_file_path, write_log
 from ccb_protocol import make_req_id
+from project_id import compute_ccb_project_id
+from provider_health import ProviderHealthManager, CircuitState
 from providers import ProviderDaemonSpec, make_qualified_key, parse_qualified_provider
+from task_journal import TaskJournal, TaskState
 from worker_pool import BaseSessionWorker, PerSessionWorkerPool
 
 
@@ -41,8 +44,12 @@ def _write_log(line: str) -> None:
 class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
     """Worker thread for processing tasks for a specific session."""
 
-    def __init__(self, session_key: str, adapter: BaseProviderAdapter):
-        super().__init__(session_key)
+    def __init__(self, session_key: str, adapter: BaseProviderAdapter,
+                 journal: Optional[TaskJournal] = None):
+        def _on_start(task: QueuedTask) -> None:
+            if journal and not getattr(task, 'cancelled', False):
+                journal.record(task.req_id, adapter.key, TaskState.RUNNING)
+        super().__init__(session_key, on_task_start=_on_start)
         self.adapter = adapter
 
     def _handle_task(self, task: QueuedTask) -> ProviderResult:
@@ -56,8 +63,9 @@ class _SessionWorker(BaseSessionWorker[QueuedTask, ProviderResult]):
 class _UnifiedWorkerPool:
     """Worker pool that routes tasks to provider-specific workers."""
 
-    def __init__(self, registry: ProviderRegistry):
+    def __init__(self, registry: ProviderRegistry, journal: Optional[TaskJournal] = None):
         self._registry = registry
+        self._journal = journal
         self._pools: Dict[str, PerSessionWorkerPool[_SessionWorker]] = {}
         self._lock = threading.Lock()
 
@@ -88,9 +96,10 @@ class _UnifiedWorkerPool:
         session_key = adapter.compute_session_key(session, instance=instance) if session else f"{pool_key}:unknown"
 
         pool = self._get_pool(pool_key)
+        journal = self._journal
         worker = pool.get_or_create(
             session_key,
-            lambda sk: _SessionWorker(sk, adapter),
+            lambda sk: _SessionWorker(sk, adapter, journal=journal),
         )
         worker.enqueue(task)
         return task
@@ -118,7 +127,9 @@ class UnifiedAskDaemon:
         self.state_file = state_file or state_file_path(ASKD_SPEC.state_file_name)
         self.token = random_token()
         self.registry = registry or ProviderRegistry()
-        self.pool = _UnifiedWorkerPool(self.registry)
+        self.health = ProviderHealthManager()
+        self.journal = TaskJournal()
+        self.pool = _UnifiedWorkerPool(self.registry, journal=self.journal)
         self.work_dir = work_dir
 
     def _handle_request(self, msg: dict) -> dict:
@@ -182,9 +193,52 @@ class UnifiedAskDaemon:
             }
 
         request.instance = instance
+
+        # Generate req_id before any journal writes
+        if not request.req_id:
+            request.req_id = make_req_id()
+        req_id = request.req_id
         pool_key = make_qualified_key(base_provider, instance)
+
+        # Health key includes project ID for cross-project isolation
+        try:
+            _project_id = compute_ccb_project_id(Path(request.work_dir)) if request.work_dir else ""
+        except Exception:
+            _project_id = ""
+        health_key = f"{pool_key}:{_project_id}" if _project_id else pool_key
+
+        # Circuit breaker gate
+        breaker = self.health.get_breaker(health_key)
+        cb_state = breaker.state
+        if cb_state == CircuitState.OPEN:
+            _write_log(f"[REJECT] provider={base_provider} req_id={req_id} reason=circuit_open")
+            return {
+                "type": "ask.response", "v": 1, "id": msg.get("id"), "exit_code": 3,
+                "reply": f"Provider {base_provider} circuit OPEN "
+                         f"(failures={breaker.failure_count}/{breaker.failure_threshold})",
+            }
+        if cb_state == CircuitState.HALF_OPEN:
+            if not self.health.try_acquire_probe(health_key):
+                _write_log(f"[REJECT] provider={base_provider} req_id={req_id} reason=circuit_half_open_probe_in_flight")
+                return {
+                    "type": "ask.response", "v": 1, "id": msg.get("id"), "exit_code": 3,
+                    "reply": f"Provider {base_provider} circuit HALF_OPEN (probe in flight)",
+                }
+
+        is_fire_and_forget = float(request.timeout_s) == 0.0
+        _write_log(f"[REQ] provider={base_provider} req_id={req_id} caller={caller}")
+
+        # Journal: QUEUED (skip for fire-and-forget)
+        if not is_fire_and_forget:
+            self.journal.record(req_id, base_provider, TaskState.QUEUED)
+
         task = self.pool.submit(pool_key, request)
         if not task:
+            if cb_state == CircuitState.HALF_OPEN:
+                self.health.release_probe(health_key)
+            if not is_fire_and_forget:
+                self.journal.record(req_id, base_provider, TaskState.FAILED,
+                                    meta={"reason": "submit_failed"})
             return {
                 "type": "ask.response",
                 "v": 1,
@@ -193,16 +247,31 @@ class UnifiedAskDaemon:
                 "reply": f"Failed to submit task for provider: {provider}",
             }
 
+        _write_log(f"[DISPATCH] provider={base_provider} req_id={req_id}")
+
         wait_timeout = None if float(request.timeout_s) < 0.0 else (float(request.timeout_s) + 5.0)
         task.done_event.wait(timeout=wait_timeout)
         result = task.result
 
-        # If timeout occurred and task is still running, mark it as cancelled
+        # Timeout/cancel handling + health/journal recording
         if not result and not task.done_event.is_set():
-            _write_log(f"[WARN] Task timeout, marking as cancelled: provider={provider} req_id={task.req_id}")
+            _write_log(f"[TIMEOUT] provider={base_provider} req_id={req_id}")
             task.cancelled = True
             if task.cancel_event:
                 task.cancel_event.set()
+            if cb_state == CircuitState.HALF_OPEN:
+                self.health.release_probe(health_key)
+            if not is_fire_and_forget:
+                self.journal.record(req_id, base_provider, TaskState.CANCELLED,
+                                    meta={"reason": "daemon_wait_timeout"})
+        elif result and not is_fire_and_forget:
+            self.health.record_result(health_key, result.exit_code, result.reply[:200])
+            _write_log(f"[RESULT] provider={base_provider} req_id={req_id} exit={result.exit_code} done={result.done_seen}")
+            if result.exit_code == 0:
+                self.journal.record(req_id, base_provider, TaskState.COMPLETED)
+            else:
+                self.journal.record(req_id, base_provider, TaskState.FAILED,
+                                    meta={"exit_code": result.exit_code})
 
         if not result:
             return {
@@ -239,6 +308,14 @@ class UnifiedAskDaemon:
         import askd_rpc
 
         self.registry.start_all()
+
+        try:
+            expired = self.journal.expire_stale(max_age_s=3600.0)
+            if expired:
+                _write_log(f"[INFO] Expired {len(expired)} stale tasks from previous run")
+            self.journal.truncate(keep_last_n=1000)
+        except Exception as e:
+            _write_log(f"[WARN] Journal cleanup: {e}")
 
         def _on_stop() -> None:
             self.registry.stop_all()

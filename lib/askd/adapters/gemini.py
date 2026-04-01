@@ -173,6 +173,17 @@ class GeminiAdapter(BaseProviderAdapter):
         prompt = wrap_gemini_prompt(req.message, task.req_id)
         backend.send_text(pane_id, prompt)
 
+        # Verify prompt delivery: check pane received the text, retry once if not
+        time.sleep(0.5)
+        try:
+            _pane_text = backend.get_text(pane_id, lines=10) or ""
+            if task.req_id not in _pane_text:
+                _write_log(f"[WARN] Prompt may not be delivered, retrying send req_id={task.req_id}")
+                backend.send_text(pane_id, prompt)
+                time.sleep(0.5)
+        except Exception:
+            pass
+
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
         done_seen = False
         done_ms: Optional[int] = None

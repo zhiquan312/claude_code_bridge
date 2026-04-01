@@ -333,14 +333,9 @@ def _send_via_unified_daemon(
     host = state.get("connect_host") or state.get("host") or "127.0.0.1"
     port = int(state.get("port") or 0)
     token = state.get("token") or ""
-    # Use daemon's work_dir from state file
-    # This ensures consistency with CCB session (pane id, work_dir, hash)
-    raw_work_dir = state.get("work_dir")
-    daemon_work_dir = raw_work_dir.strip() if isinstance(raw_work_dir, str) and raw_work_dir.strip() else ""
-    if not daemon_work_dir or not Path(daemon_work_dir).is_dir():
-        if daemon_work_dir:
-            print(f"[WARN] daemon work_dir not found: {daemon_work_dir}, falling back to cwd", file=sys.stderr)
-        daemon_work_dir = os.getcwd()
+    # Always use caller's cwd for routing — prevents cross-project routing
+    # when daemon was started from a different project
+    daemon_work_dir = os.getcwd()
 
     if not port:
         print("[ERROR] Invalid askd state", file=sys.stderr)

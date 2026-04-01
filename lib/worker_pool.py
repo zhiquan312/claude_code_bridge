@@ -18,11 +18,12 @@ TaskT = TypeVar("TaskT", bound=QueuedTaskLike)
 
 
 class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
-    def __init__(self, session_key: str):
+    def __init__(self, session_key: str, on_task_start: Optional[Callable] = None):
         super().__init__(daemon=True)
         self.session_key = session_key
         self._q: "queue.Queue[TaskT]" = queue.Queue()
         self._stop_event = threading.Event()
+        self._on_task_start = on_task_start  # Optional callback, None = no-op (legacy compat)
 
     def enqueue(self, task: TaskT) -> None:
         self._q.put(task)
@@ -43,6 +44,11 @@ class BaseSessionWorker(threading.Thread, Generic[TaskT, ResultT]):
                 continue
 
             try:
+                if self._on_task_start and not getattr(task, 'cancelled', False):
+                    try:
+                        self._on_task_start(task)
+                    except Exception:
+                        pass
                 task.result = self._handle_task(task)
             except Exception as exc:
                 task.result = self._handle_exception(exc, task)

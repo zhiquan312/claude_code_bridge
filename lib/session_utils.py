@@ -155,7 +155,7 @@ def find_project_session_file(work_dir: Path, session_filename: str) -> Optional
     except Exception:
         current = Path(work_dir).absolute()
 
-    for root in [current, *current.parents]:
+    for i, root in enumerate([current, *current.parents]):
         candidate = root / CCB_PROJECT_CONFIG_DIRNAME / session_filename
         if candidate.exists():
             return candidate
@@ -165,4 +165,11 @@ def find_project_session_file(work_dir: Path, session_filename: str) -> Optional
         legacy = root / session_filename
         if legacy.exists():
             return legacy
+        # Stop at project boundary: if this ancestor has .ccb or .ccb_config
+        # but not our session file, it's a different project — stop walking
+        if i > 0:
+            if (root / CCB_PROJECT_CONFIG_DIRNAME).is_dir():
+                break
+            if (root / CCB_PROJECT_CONFIG_LEGACY_DIRNAME).is_dir():
+                break
     return None
