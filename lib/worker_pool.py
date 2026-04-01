@@ -70,12 +70,25 @@ class PerSessionWorkerPool(Generic[WorkerT]):
         self._lock = threading.Lock()
         self._workers: dict[str, WorkerT] = {}
 
+    @staticmethod
+    def _is_worker_alive(worker: WorkerT) -> bool:
+        try:
+            return worker.is_alive()
+        except (AssertionError, RuntimeError):
+            started = getattr(worker, "_started", None)
+            if hasattr(started, "is_set"):
+                try:
+                    return bool(started.is_set())
+                except Exception:
+                    return False
+            return False
+
     def get_or_create(self, session_key: str, factory: Callable[[str], WorkerT]) -> WorkerT:
         created = False
         with self._lock:
             worker = self._workers.get(session_key)
             # Check if worker thread is dead and needs replacement
-            if worker is not None and not worker.is_alive():
+            if worker is not None and not self._is_worker_alive(worker):
                 # Worker thread died, remove it and create a new one
                 self._workers.pop(session_key, None)
                 worker = None

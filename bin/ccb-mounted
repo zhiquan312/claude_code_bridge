@@ -4,15 +4,15 @@
 
 set -euo pipefail
 
-PROVIDERS="codex:cask gemini:gask opencode:oask claude:lask droid:dask"
+PROVIDERS=(codex gemini opencode claude droid)
 CWD=$(pwd)
 FORMAT="--json"
 AUTOSTART=false
 
-# Get script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# Argument parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --simple)
@@ -40,73 +40,70 @@ done
 
 # Normalize CWD for Windows (convert /e/... to E:/...)
 if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
-  # Convert msys path /e/foo to E:/foo
   if [[ "$CWD" =~ ^/([a-zA-Z])/ ]]; then
     CWD="${BASH_REMATCH[1]^}:${CWD:2}"
   fi
 fi
 
-# Detect OS and get online daemons accordingly
-if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ -n "${WINDIR:-}" ]]; then
-  # Windows: use ping command to check each provider directly
-  MOUNTED=""
-  for pair in $PROVIDERS; do
-    provider="${pair%%:*}"
-    # Check session file exists first
-    if [[ -f "$CWD/.ccb/.${provider}-session" ]] || [[ -f "$CWD/.ccb_config/.${provider}-session" ]] || [[ -f "$CWD/.${provider}-session" ]]; then
-      # Try the ping command to check if daemon is responsive
-      PING_ARGS=("$provider")
-      if [[ "$AUTOSTART" == true ]]; then
-        PING_ARGS+=("--autostart")
-      fi
-      if (cd "$CWD" && "$SCRIPT_DIR/ccb-ping" "${PING_ARGS[@]}") >/dev/null 2>&1; then
-        MOUNTED="$MOUNTED $provider"
-      fi
-    fi
-  done
-else
-  # Linux/macOS: use pgrep
-  ONLINE=$(pgrep -af "bin/[cglod]askd$" 2>/dev/null | grep -oE "[cglod]askd" | sort -u || true)
+resolve_session_file() {
+  local provider="$1"
+  "$PYTHON_BIN" - "$CWD" "$provider" "$LIB_DIR" <<'PY'
+import sys
+from pathlib import Path
 
-  MOUNTED=""
-  for pair in $PROVIDERS; do
-    provider="${pair%%:*}"
-    daemon="${pair##*:}"
+work_dir = Path(sys.argv[1])
+provider = sys.argv[2]
+lib_dir = Path(sys.argv[3])
+sys.path.insert(0, str(lib_dir))
 
-    # Check session file exists
-    if [[ -f "$CWD/.ccb/.${provider}-session" ]] || [[ -f "$CWD/.ccb_config/.${provider}-session" ]] || [[ -f "$CWD/.${provider}-session" ]]; then
-      # Check daemon is online
-      IS_ONLINE=false
-      if echo "$ONLINE" | grep -q "${daemon}d"; then
-        IS_ONLINE=true
-      fi
+try:
+    from session_utils import find_project_session_file
+    path = find_project_session_file(work_dir, f".{provider}-session")
+except Exception:
+    path = None
 
-      if [[ "$IS_ONLINE" == false ]] && [[ "$AUTOSTART" == true ]]; then
-        # Try to autostart if requested and not online
-        if (cd "$CWD" && "$SCRIPT_DIR/ccb-ping" "$provider" --autostart) >/dev/null 2>&1; then
-           IS_ONLINE=true
-        fi
-      fi
+print("" if path is None else str(path))
+PY
+}
 
-      if [[ "$IS_ONLINE" == true ]]; then
-        MOUNTED="$MOUNTED $provider"
-      fi
-    fi
-  done
-fi
+MOUNTED=()
+for provider in "${PROVIDERS[@]}"; do
+  session_file="$(resolve_session_file "$provider")"
+  if [[ -z "$session_file" ]]; then
+    continue
+  fi
 
-MOUNTED=$(echo $MOUNTED | xargs)  # trim
+  PING_ARGS=("$provider" "--session-file" "$session_file")
+  if [[ "$AUTOSTART" == true ]]; then
+    PING_ARGS+=("--autostart")
+  fi
+
+  # Delegate health detection to ccb-ping so mounted stays aligned with
+  # unified askd, provider-specific state, and shared session resolution.
+  if (cd "$CWD" && "$SCRIPT_DIR/ccb-ping" "${PING_ARGS[@]}") >/dev/null 2>&1; then
+    MOUNTED+=("$provider")
+  fi
+done
 
 case "$FORMAT" in
   --simple)
-    echo "$MOUNTED"
+    echo "${MOUNTED[*]:-}"
     ;;
   --json|*)
-    if [[ -z "$MOUNTED" ]]; then
-      echo "{\"cwd\":\"$CWD\",\"mounted\":[]}"
+    if [[ ${#MOUNTED[@]} -eq 0 ]]; then
+      "$PYTHON_BIN" - "$CWD" <<'PY'
+import json
+import sys
+
+print(json.dumps({"cwd": sys.argv[1], "mounted": []}))
+PY
     else
-      JSON_ARRAY=$(echo "$MOUNTED" | sed 's/ /","/g;s/^/"/;s/$/"/')
-      echo "{\"cwd\":\"$CWD\",\"mounted\":[$JSON_ARRAY]}"
+      "$PYTHON_BIN" - "$CWD" "${MOUNTED[@]}" <<'PY'
+import json
+import sys
+
+print(json.dumps({"cwd": sys.argv[1], "mounted": sys.argv[2:]}))
+PY
     fi
     ;;
 esac

@@ -33,6 +33,48 @@ def test_find_project_session_file_prefers_ccb_config(tmp_path: Path) -> None:
     assert find_project_session_file(root, ".codex-session") == primary
 
 
+def test_find_project_session_file_stops_at_ccb_boundary(tmp_path: Path) -> None:
+    """Session walk must stop at .ccb/ boundary to prevent cross-project leakage.
+
+    Regression: without the boundary check, a subdirectory inside project A
+    would inherit project B's session if B was a parent directory with .ccb/.
+    """
+    # Parent project with its own .ccb/ and a claude session
+    parent_project = tmp_path / "parent"
+    parent_project.mkdir()
+    parent_ccb = parent_project / ".ccb"
+    parent_ccb.mkdir()
+    (parent_ccb / ".claude-session").write_text('{"pane_id":"parent-pane"}', encoding="utf-8")
+
+    # Child project inside parent, has its own .ccb/ but NO claude session
+    child_project = parent_project / "child"
+    child_project.mkdir()
+    child_ccb = child_project / ".ccb"
+    child_ccb.mkdir()
+
+    subdir = child_project / "src" / "lib"
+    subdir.mkdir(parents=True)
+
+    # From child's subdir, should NOT find parent's session (boundary stops walk)
+    found = find_project_session_file(subdir, ".claude-session")
+    assert found is None, f"Session leaked from parent project: {found}"
+
+
+def test_find_project_session_file_finds_own_session_in_subdir(tmp_path: Path) -> None:
+    """Subdirectory should find its own project's session, not a parent's."""
+    project = tmp_path / "myproject"
+    project.mkdir()
+    ccb = project / ".ccb"
+    ccb.mkdir()
+    (ccb / ".claude-session").write_text('{"pane_id":"my-pane"}', encoding="utf-8")
+
+    subdir = project / "src" / "components"
+    subdir.mkdir(parents=True)
+
+    found = find_project_session_file(subdir, ".claude-session")
+    assert found == ccb / ".claude-session"
+
+
 def test_safe_write_session_atomic_write(tmp_path: Path) -> None:
     target = tmp_path / "state.json"
     ok, err = safe_write_session(target, '{"hello":"world"}\n')

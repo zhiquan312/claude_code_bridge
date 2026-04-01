@@ -119,6 +119,57 @@ def test_nested_subdir_same_project_id(tmp_path: Path) -> None:
         assert compute_ccb_project_id(d) == root_pid, f"{d} got different project ID"
 
 
+def test_home_dir_ccb_excluded_from_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """~/.ccb is CCB runtime state, not a project anchor.
+
+    Regression: without $HOME exclusion, every directory under $HOME lacking
+    its own .ccb/ would collapse to the home directory, causing cross-project
+    routing collisions.
+    """
+    # Simulate $HOME with a .ccb/ directory (runtime state)
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    (fake_home / ".ccb").mkdir()
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    # Two separate project dirs under fake $HOME, neither has .ccb/
+    proj_a = fake_home / "projects" / "alpha"
+    proj_b = fake_home / "projects" / "beta"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+
+    # They should NOT collapse to fake_home — they should be independent
+    pid_a = compute_ccb_project_id(proj_a)
+    pid_b = compute_ccb_project_id(proj_b)
+    assert pid_a != pid_b, "Projects under $HOME collapsed to same ID (home anchor not excluded)"
+
+    # find_project_root should return the dirs themselves, not $HOME
+    assert find_project_root(proj_a) == proj_a
+    assert find_project_root(proj_b) == proj_b
+
+
+def test_subdir_with_ccb_under_home_resolves_correctly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A project under $HOME WITH its own .ccb/ should resolve to itself,
+    not to $HOME's .ccb/."""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    (fake_home / ".ccb").mkdir()
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    # Project with its own .ccb/
+    proj = fake_home / "myproject"
+    proj.mkdir()
+    (proj / ".ccb").mkdir()
+    subdir = proj / "src" / "lib"
+    subdir.mkdir(parents=True)
+
+    # Should resolve to proj, not fake_home
+    assert find_project_root(subdir) == proj
+    assert compute_ccb_project_id(subdir) == compute_ccb_project_id(proj)
+
+
 def test_nested_ccb_stops_at_nearest_anchor(tmp_path: Path) -> None:
     """When a subdirectory has its own .ccb/, it should be its own project root."""
     (tmp_path / ".ccb").mkdir()

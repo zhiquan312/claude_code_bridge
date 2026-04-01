@@ -92,3 +92,47 @@ def test_ccb_mounted_autostart_uses_target_path(tmp_path: Path) -> None:
         assert (run_dir / "askd.json").exists()
     finally:
         _shutdown_askd(run_dir)
+
+
+def test_ccb_mounted_does_not_false_positive_on_unhealthy_session(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    other_dir = tmp_path / "other"
+    run_dir = tmp_path / "run"
+    project_dir.mkdir()
+    other_dir.mkdir()
+    run_dir.mkdir()
+    session_file = _write_gemini_session(project_dir)
+
+    env = dict(os.environ)
+    env["CCB_GASKD"] = "1"
+    env["CCB_GASKD_AUTOSTART"] = "1"
+    env["CCB_RUN_DIR"] = str(run_dir)
+
+    try:
+        ping_result = subprocess.run(
+            [str(CCB_PING_BIN), "gemini", "--session-file", str(session_file), "--autostart"],
+            cwd=str(other_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # Autostart may start askd, but health still fails because the synthetic
+        # session points at a fake tmux pane. Mounted must not report it online
+        # just because unified askd is running.
+        assert ping_result.returncode != 0
+        assert (run_dir / "askd.json").exists()
+
+        result = subprocess.run(
+            ["bash", str(CCB_MOUNTED_BIN), str(project_dir)],
+            cwd=str(other_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        parsed = json.loads(result.stdout)
+        assert "gemini" not in parsed.get("mounted", [])
+    finally:
+        _shutdown_askd(run_dir)

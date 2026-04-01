@@ -638,7 +638,8 @@ def main() -> int:
         timeout = env_float("CCB_COMPLETION_HOOK_TIMEOUT", 10.0)
         ask_cmd = find_ask_command()
         if not ask_cmd:
-            return 0
+            _debug_log("no ask command found, delivery failed")
+            return 1
         try:
             env = os.environ.copy()
             if caller:
@@ -663,8 +664,8 @@ def main() -> int:
             _debug_log(f"ask --notify fallback rc={result.returncode}")
             return result.returncode
         except Exception:
-            _debug_log("ask --notify fallback exception")
-            return 0
+            _debug_log("ask --notify fallback exception, delivery failed")
+            return 1
 
     # Send directly via terminal backend
     terminal_ok = send_via_terminal(pane_id, message, terminal, session_data)
@@ -676,13 +677,14 @@ def main() -> int:
     timeout = env_float("CCB_COMPLETION_HOOK_TIMEOUT", 10.0)
     ask_cmd = find_ask_command()
     if not ask_cmd:
-        return 0
+        _debug_log("terminal send failed and no ask command found, delivery failed")
+        return 1
     try:
         env = os.environ.copy()
         if caller:
             env["CCB_CALLER"] = caller
         if os.name == "nt":
-            subprocess.run(
+            fallback_result = subprocess.run(
                 [sys.executable, ask_cmd, caller, "--notify", "--no-wrap", message],
                 capture_output=True,
                 text=True,
@@ -697,11 +699,11 @@ def main() -> int:
                 timeout=timeout,
                 env=env,
             )
-        _debug_log(f"post-failure ask --notify rc={fallback_result.returncode if 'fallback_result' in locals() else 'n/a'}")
+        _debug_log(f"post-failure ask --notify rc={fallback_result.returncode}")
+        return fallback_result.returncode
     except Exception:
-        _debug_log("post-failure ask --notify exception")
-        pass
-    return 0
+        _debug_log("post-failure ask --notify exception, delivery failed")
+        return 1
 
 
 if __name__ == "__main__":
