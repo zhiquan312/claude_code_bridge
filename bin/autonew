@@ -14,8 +14,10 @@ without any context injection or protocol wrapping.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
@@ -45,6 +47,24 @@ def _usage() -> None:
     print("  gemini, codex, opencode, droid, claude", file=sys.stderr)
     print("", file=sys.stderr)
     print("Sends /new to the provider's pane to start a new session.", file=sys.stderr)
+
+
+def _predismiss_codex_update_prompt(provider: str) -> None:
+    # Best-effort only: this touches Codex's internal update state and may
+    # stop working if upstream changes the schema.
+    if provider != "codex":
+        return
+    try:
+        version_file = Path.home() / ".codex" / "version.json"
+        if not version_file.exists():
+            return
+        payload = json.loads(version_file.read_text(encoding="utf-8"))
+        latest = str(payload.get("latest_version") or "").strip()
+        if latest and str(payload.get("dismissed_version") or "").strip() != latest:
+            payload["dismissed_version"] = latest
+            version_file.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def main(argv: list[str]) -> int:
@@ -139,7 +159,38 @@ def main(argv: list[str]) -> int:
     # Send reset command to the pane
     reset_cmd = PROVIDER_COMMANDS[provider]
     try:
+        _predismiss_codex_update_prompt(provider)
         backend.send_text(pane_id, reset_cmd)
+        # Post-send liveness poll. Poll all iterations with no early exit:
+        # the hijack case can kill the pane shortly after the send succeeds.
+        died_after_send = False
+        for _ in range(6):
+            time.sleep(0.5)
+            try:
+                if not backend.is_alive(pane_id):
+                    died_after_send = True
+                    break
+            except Exception:
+                pass
+
+        if died_after_send:
+            print(f"[WARN] {provider} pane {pane_id} died after send. Recovering...", file=sys.stderr)
+            recovered = False
+            if loader_info:
+                try:
+                    session = loader(work_dir)
+                    if session:
+                        ok, new_pane = session.ensure_pane()
+                        if ok:
+                            print(f"[OK] Recovered {provider} to pane {new_pane}", file=sys.stderr)
+                            time.sleep(3)
+                            backend.send_text(new_pane, reset_cmd)
+                            recovered = True
+                except Exception as e:
+                    print(f"[ERROR] Recovery failed: {e}", file=sys.stderr)
+            if not recovered:
+                print(f"[ERROR] {provider} pane died and could not recover.", file=sys.stderr)
+                return EXIT_ERROR
         print(f"Sent {reset_cmd} to {provider} (pane: {pane_id})")
         return EXIT_OK
     except Exception as e:

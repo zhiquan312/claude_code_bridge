@@ -11,9 +11,11 @@ Providers:
     gemini, codex, opencode, droid, claude
 """
 
-import sys
-import os
 import argparse
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
@@ -55,6 +57,82 @@ def _resolve_work_dir(session_file: str | None) -> Path:
     if parent_name in (".ccb", ".ccb_config"):
         return p.parent.parent
     return p.parent
+
+
+def _instance_from_session_file(provider: str, session_file: str | None) -> str | None:
+    if not session_file:
+        return None
+    name = Path(os.path.expanduser(session_file)).name
+    base = f".{provider}-session"
+    if name == base:
+        return None
+    prefix = f".{provider}-"
+    suffix = "-session"
+    if name.startswith(prefix) and name.endswith(suffix):
+        return name[len(prefix):-len(suffix)] or None
+    return None
+
+
+def _update_codex_pid_after_recovery(provider: str, session: object, pane_id: str) -> None:
+    if provider != "codex" or not session or not pane_id:
+        return
+    runtime_dir = getattr(session, "runtime_dir", None)
+    if runtime_dir is None:
+        return
+    try:
+        runtime = Path(runtime_dir)
+    except Exception:
+        return
+    pid = None
+    backend = None
+    try:
+        backend = session.backend()
+    except Exception:
+        backend = None
+    get_pane_pid = getattr(backend, "get_pane_pid", None) if backend else None
+    if callable(get_pane_pid):
+        try:
+            pid = str(get_pane_pid(pane_id) or "").strip()
+        except Exception:
+            pid = None
+    if not pid:
+        try:
+            cp = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", str(pane_id), "#{pane_pid}"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            candidate = (cp.stdout or "").strip()
+            if cp.returncode == 0 and candidate.isdigit():
+                pid = candidate
+        except Exception:
+            pid = None
+    if pid and str(pid).isdigit():
+        try:
+            runtime.mkdir(parents=True, exist_ok=True)
+            (runtime / "codex.pid").write_text(f"{pid}\n", encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _predismiss_codex_update_prompt(provider: str) -> None:
+    # Best-effort only: this touches Codex's internal update state and may
+    # stop working if upstream changes the schema.
+    if provider != "codex":
+        return
+    try:
+        version_file = Path.home() / ".codex" / "version.json"
+        if not version_file.exists():
+            return
+        payload = json.loads(version_file.read_text(encoding="utf-8"))
+        latest = str(payload.get("latest_version") or "").strip()
+        if latest and str(payload.get("dismissed_version") or "").strip() != latest:
+            payload["dismissed_version"] = latest
+            version_file.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def main():
@@ -116,6 +194,36 @@ def main():
                     wait_for_daemon_ready(spec, 0.5)
             except Exception as e:
                 print(f"[WARN] Autostart pre-check failed: {e}", file=sys.stderr)
+
+        _session_mods = {
+            "codex": "caskd_session",
+            "gemini": "gaskd_session",
+            "opencode": "oaskd_session",
+            "droid": "daskd_session",
+            "claude": "laskd_session",
+        }
+        _smod = _session_mods.get(provider)
+        if _smod:
+            _instance = _instance_from_session_file(provider, args.session_file)
+            _skip_recovery = (
+                args.session_file
+                and _instance is None
+                and Path(args.session_file).name != f".{provider}-session"
+            )
+            if not _skip_recovery:
+                try:
+                    _mod = __import__(_smod)
+                    _session = getattr(_mod, "load_project_session")(work_dir, _instance)
+                    if _session:
+                        _ok, _pane = _session.ensure_pane()
+                        if _ok:
+                            _update_codex_pid_after_recovery(provider, _session, _pane)
+                        else:
+                            print(f"[WARN] Pane recovery failed: {_pane}", file=sys.stderr)
+                except Exception:
+                    pass
+
+        _predismiss_codex_update_prompt(provider)
 
         comm = comm_class()
         healthy, message = comm.ping(display=False)
