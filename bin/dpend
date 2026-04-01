@@ -55,6 +55,13 @@ def _update_session_file(work_dir: Path, actual_session: Path) -> None:
     session_file = find_project_session_file(work_dir, ".droid-session")
     if not session_file:
         return
+    # Only write back if session file is in the current project's .ccb dir
+    try:
+        ccb_dir = work_dir / ".ccb"
+        if not session_file.parent.samefile(ccb_dir):
+            return
+    except Exception:
+        return
     try:
         with session_file.open("r", encoding="utf-8") as f:
             data = json.load(f)

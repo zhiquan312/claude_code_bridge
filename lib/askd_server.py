@@ -352,11 +352,38 @@ class AskDaemonServer:
         except (ValueError, TypeError):
             interval = 2.0
 
+        health_check_counter = 0
         while not self._heartbeat_stop_event.wait(interval):
             try:
                 self._write_persistent_state("running")
             except Exception:
                 pass
+            # Periodic pane health check (every ~30s)
+            health_check_counter += 1
+            if health_check_counter % max(1, int(30.0 / interval)) == 0:
+                try:
+                    import json as _json
+                    from pathlib import Path as _Path
+                    ccb_dir = _Path(self.work_dir) / ".ccb"
+                    if ccb_dir.is_dir():
+                        from terminal import get_backend_for_session
+                        for sf in ccb_dir.glob(".*-session"):
+                            try:
+                                data = _json.loads(sf.read_text())
+                                pid = data.get("pane_id", "")
+                                if not pid:
+                                    continue
+                                backend = get_backend_for_session(data)
+                                if backend and not backend.is_alive(pid):
+                                    from askd_runtime import log_path, write_log
+                                    write_log(
+                                        log_path("askd.log"),
+                                        f"[HEALTH] Dead pane: {sf.name} pane={pid}",
+                                    )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
     def _stop_heartbeat_thread(self) -> None:
         """Stop heartbeat thread."""

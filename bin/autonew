@@ -92,14 +92,49 @@ def main(argv: list[str]) -> int:
         print("[ERROR] Terminal backend not available.", file=sys.stderr)
         return EXIT_ERROR
 
-    # Check if pane is alive
-    try:
-        if not backend.is_alive(pane_id):
-            print(f"[ERROR] {provider} pane {pane_id} is not alive.", file=sys.stderr)
+    # Use ensure_pane() to handle stale bindings before sending /new
+    session_loaders = {
+        "codex": ("caskd_session", "load_project_session"),
+        "gemini": ("gaskd_session", "load_project_session"),
+        "opencode": ("oaskd_session", "load_project_session"),
+        "droid": ("daskd_session", "load_project_session"),
+        "claude": ("laskd_session", "load_project_session"),
+    }
+    loader_info = session_loaders.get(provider)
+    if loader_info:
+        try:
+            mod = __import__(loader_info[0])
+            loader = getattr(mod, loader_info[1])
+            session = loader(work_dir)
+            if session:
+                ok, pane_or_err = session.ensure_pane()
+                if ok:
+                    pane_id = pane_or_err
+                else:
+                    print(f"[ERROR] Could not ensure pane for {provider}: {pane_or_err}", file=sys.stderr)
+                    return EXIT_ERROR
+            else:
+                print(f"[ERROR] No session loaded for {provider}.", file=sys.stderr)
+                return EXIT_ERROR
+        except Exception as e:
+            # Fallback to basic alive check if session loader fails
+            print(f"[WARN] ensure_pane failed ({e}), trying basic alive check", file=sys.stderr)
+            try:
+                if not backend.is_alive(pane_id):
+                    print(f"[ERROR] {provider} pane {pane_id} is not alive.", file=sys.stderr)
+                    return EXIT_ERROR
+            except Exception as e2:
+                print(f"[ERROR] Failed to check pane status: {e2}", file=sys.stderr)
+                return EXIT_ERROR
+    else:
+        # Unknown provider — basic alive check
+        try:
+            if not backend.is_alive(pane_id):
+                print(f"[ERROR] {provider} pane {pane_id} is not alive.", file=sys.stderr)
+                return EXIT_ERROR
+        except Exception as e:
+            print(f"[ERROR] Failed to check pane status: {e}", file=sys.stderr)
             return EXIT_ERROR
-    except Exception as e:
-        print(f"[ERROR] Failed to check pane status: {e}", file=sys.stderr)
-        return EXIT_ERROR
 
     # Send reset command to the pane
     reset_cmd = PROVIDER_COMMANDS[provider]

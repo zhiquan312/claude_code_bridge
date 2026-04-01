@@ -57,9 +57,23 @@ def _load_session_path(work_dir: Path) -> Path | None:
 
 
 def _update_session_file(work_dir: Path, actual_session: Path) -> None:
-    """Update .gemini-session with actual session path if different"""
+    """Update .gemini-session with actual session path if different.
+
+    Only updates if session file was loaded from the canonical project .ccb dir
+    (not from auto-detection or parent directory fallback).
+    Uses safe_write_session to prevent corruption on interruption.
+    """
     session_file = find_project_session_file(work_dir, ".gemini-session")
     if not session_file:
+        return
+    # Only write back if session file is in the current project's .ccb dir
+    # (not inherited from parent or auto-detected from registry)
+    try:
+        ccb_dir = work_dir / ".ccb"
+        if not session_file.parent.samefile(ccb_dir):
+            _debug(f"Skipping write-back: session file not in project .ccb dir")
+            return
+    except Exception:
         return
     try:
         with session_file.open("r", encoding="utf-8") as f:
@@ -75,9 +89,12 @@ def _update_session_file(work_dir: Path, actual_session: Path) -> None:
         except Exception:
             pass
 
-        with session_file.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        _debug(f"Updated .gemini-session with: {actual_str}")
+        from session_utils import safe_write_session
+        ok, err = safe_write_session(session_file, json.dumps(data, ensure_ascii=False, indent=2))
+        if ok:
+            _debug(f"Updated .gemini-session with: {actual_str}")
+        else:
+            _debug(f"Failed to write .gemini-session: {err}")
     except Exception as exc:
         _debug(f"Failed to update .gemini-session: {exc}")
 
