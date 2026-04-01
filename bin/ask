@@ -46,6 +46,7 @@ from compat import read_stdin_text, setup_windows_encoding
 setup_windows_encoding()
 
 from cli_output import EXIT_ERROR, EXIT_OK
+from project_id import find_project_root
 from providers import parse_qualified_provider
 from session_utils import find_project_session_file
 
@@ -333,9 +334,9 @@ def _send_via_unified_daemon(
     host = state.get("connect_host") or state.get("host") or "127.0.0.1"
     port = int(state.get("port") or 0)
     token = state.get("token") or ""
-    # Always use caller's cwd for routing — prevents cross-project routing
-    # when daemon was started from a different project
-    daemon_work_dir = os.getcwd()
+    # Canonicalize to the project root so subdirectory calls route to the
+    # same project identity, breaker bucket, and session as the project root.
+    daemon_work_dir = str(find_project_root(Path(os.getcwd())))
 
     if not port:
         print("[ERROR] Invalid askd state", file=sys.stderr)
@@ -667,6 +668,7 @@ def main(argv: list[str]) -> int:
         script_file = log_dir / f"ask-{provider}-{task_id}.ps1"
         status_file_win = str(status_file).replace('"', '`"')
         log_file_win = str(log_file).replace('"', '`"')
+        python_exe_win = sys.executable.replace('"', '`"')
 
         # Pass CCB_RUN_DIR so background script can find askd state file
         ccb_run_dir = os.environ.get("CCB_RUN_DIR", "")
@@ -701,7 +703,7 @@ function Write-CcbStatus([string]$line) {{
   Add-Content -Path $statusFile -Value ("{{0}} {{1}}" -f (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz"), $line) -Encoding UTF8
 }}
 Write-CcbStatus "running pid=$PID"
-Get-Content -Path "{msg_file}" -Encoding UTF8 | python "{ask_cmd}" {provider} --foreground --timeout {timeout}
+Get-Content -Path "{msg_file}" -Encoding UTF8 | "{python_exe_win}" "{ask_cmd}" {provider} --foreground --timeout {timeout}
 $rc = $LASTEXITCODE
 Write-CcbStatus "finished exit_code=$rc"
 if ($rc -ne 0) {{
@@ -744,6 +746,7 @@ exit $rc
         quoted_status = shlex.quote(str(status_file))
         quoted_ask_cmd = shlex.quote(ask_cmd)
         quoted_provider = shlex.quote(provider)
+        quoted_python = shlex.quote(sys.executable)
         bg_script = f'''#!/bin/sh
 set +e
 _now() {{
@@ -754,7 +757,7 @@ echo "[CCB_TASK_START] task={task_id} provider={provider} caller={caller} pid=$$
 export CCB_REQ_ID="{task_id}"
 export CCB_CALLER="{caller}"
 export CCB_WORK_DIR="{os.getcwd()}"
-{run_dir_line}{email_env_lines}{pane_env_lines}python3 {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout} <<'ASKEOF'
+{run_dir_line}{email_env_lines}{pane_env_lines}{quoted_python} {quoted_ask_cmd} {quoted_provider} --foreground --timeout {timeout} <<'ASKEOF'
 {message}
 ASKEOF
 rc=$?

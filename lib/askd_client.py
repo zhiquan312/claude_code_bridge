@@ -18,7 +18,7 @@ from session_utils import (
     find_project_session_file,
     resolve_project_config_dir,
 )
-from project_id import compute_ccb_project_id
+from project_id import compute_ccb_project_id, find_project_root
 from pane_registry import load_registry_by_project_id
 
 
@@ -101,12 +101,14 @@ def resolve_work_dir_with_registry(
             default_cwd=default_cwd,
         )
 
-    # Prefer caller's cwd first — prevents cross-project routing
+    # Canonicalize to the project root so callers from any subdirectory
+    # get the same work_dir and project identity.
     cwd = default_cwd or Path.cwd()
+    project_root = find_project_root(cwd)
     try:
         found = find_project_session_file(cwd, spec.session_filename)
         if found:
-            return cwd, found
+            return project_root, found
     except Exception:
         pass
 
@@ -299,7 +301,15 @@ def maybe_start_daemon(spec: ProviderClientSpec, work_dir: Path) -> bool:
     else:
         argv = [sys.executable, entry]
     try:
-        kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+        kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+            # Start the daemon from the resolved project directory so it binds
+            # to the session file selected by --session-file / cwd routing.
+            "cwd": str(work_dir),
+        }
         if os.name == "nt":
             kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:

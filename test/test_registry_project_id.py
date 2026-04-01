@@ -118,6 +118,9 @@ def test_load_registry_by_project_id_infers_missing_project_id(tmp_path: Path, m
 
     work_dir = tmp_path / "proj"
     work_dir.mkdir()
+    # Create a project anchor so ancestor traversal from work_dir is stable
+    # even after _write_registry_file creates tmp_path/.ccb/run/ (home-level).
+    (work_dir / ".ccb").mkdir()
     pid = compute_ccb_project_id(work_dir)
 
     # Legacy record missing ccb_project_id (should infer from work_dir).

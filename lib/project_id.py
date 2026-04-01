@@ -79,24 +79,40 @@ def normalize_work_dir(value: str | Path) -> str:
 
 def _find_ccb_config_root(start_dir: Path) -> Path | None:
     """
-    Find a `.ccb/` (or legacy `.ccb_config/`) directory in the current working directory only.
+    Find the nearest ancestor (including *start_dir* itself) that contains a
+    `.ccb/` or legacy `.ccb_config/` directory.
 
-    This enforces per-directory isolation (no ancestor traversal).
+    Walking upward ensures that calls from any subdirectory inside a project
+    resolve to the same canonical project root.
     """
     try:
         current = Path(start_dir).expanduser().absolute()
     except Exception:
         current = Path.cwd()
+
     try:
-        cfg = current / ".ccb"
-        if cfg.is_dir():
-            return current
-        legacy = current / ".ccb_config"
-        if legacy.is_dir():
-            return current
+        for directory in [current, *current.parents]:
+            if (directory / ".ccb").is_dir():
+                return directory
+            if (directory / ".ccb_config").is_dir():
+                return directory
     except Exception:
         return None
     return None
+
+
+def find_project_root(work_dir: Path) -> Path:
+    """Return the canonical project root for *work_dir*.
+
+    Walks up from *work_dir* looking for `.ccb/` or `.ccb_config/`.
+    Falls back to *work_dir* itself when no config directory is found.
+    """
+    try:
+        wd = Path(work_dir).expanduser().absolute()
+    except Exception:
+        wd = Path.cwd()
+    root = _find_ccb_config_root(wd)
+    return root if root is not None else wd
 
 
 def compute_ccb_project_id(work_dir: Path) -> str:
@@ -104,8 +120,8 @@ def compute_ccb_project_id(work_dir: Path) -> str:
     Compute CCB's routing project id (ccb_project_id).
 
     Priority:
-    - Current directory containing `.ccb/` (project anchor).
-    - Current work_dir (fallback).
+    - Nearest ancestor directory containing `.ccb/` (project anchor).
+    - Current work_dir (fallback when no `.ccb/` found).
     """
     try:
         wd = Path(work_dir).expanduser().absolute()

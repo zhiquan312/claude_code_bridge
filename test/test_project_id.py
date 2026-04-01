@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from project_id import compute_ccb_project_id, normalize_work_dir
+from project_id import compute_ccb_project_id, find_project_root, normalize_work_dir
 
 
 def test_normalize_work_dir_basic() -> None:
@@ -45,7 +45,8 @@ def test_compute_ccb_project_id_uses_anchor_root(tmp_path: Path) -> None:
     pid_sub = compute_ccb_project_id(subdir)
     assert pid_root
     assert pid_sub
-    assert pid_root != pid_sub
+    # Subdirectory walks up to the .ccb/ anchor and gets the same project ID
+    assert pid_root == pid_sub
 
 
 def test_compute_ccb_project_id_ignores_env_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,3 +70,70 @@ def test_compute_ccb_project_id_fallback_diff_for_subdirs_without_anchor(tmp_pat
     subdir = tmp_path / "a" / "b"
     subdir.mkdir(parents=True, exist_ok=True)
     assert compute_ccb_project_id(tmp_path) != compute_ccb_project_id(subdir)
+
+
+# --- Nested-directory tests (ancestor traversal) ---
+
+
+def test_find_project_root_returns_ccb_ancestor(tmp_path: Path) -> None:
+    """find_project_root should walk up and return the nearest .ccb/ ancestor."""
+    (tmp_path / ".ccb").mkdir()
+    deep = tmp_path / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+
+    assert find_project_root(tmp_path) == tmp_path
+    assert find_project_root(deep) == tmp_path
+
+
+def test_find_project_root_fallback_when_no_anchor(tmp_path: Path) -> None:
+    """Without .ccb/ anywhere, find_project_root falls back to the given dir."""
+    subdir = tmp_path / "x" / "y"
+    subdir.mkdir(parents=True)
+    assert find_project_root(subdir) == subdir
+
+
+def test_find_project_root_legacy_ccb_config(tmp_path: Path) -> None:
+    """Legacy .ccb_config/ is also recognized as a project anchor."""
+    (tmp_path / ".ccb_config").mkdir()
+    deep = tmp_path / "src" / "lib"
+    deep.mkdir(parents=True)
+
+    assert find_project_root(deep) == tmp_path
+
+
+def test_nested_subdir_same_project_id(tmp_path: Path) -> None:
+    """All subdirectories under a .ccb/ project produce the same project ID."""
+    (tmp_path / ".ccb").mkdir()
+    dirs = [
+        tmp_path,
+        tmp_path / "src",
+        tmp_path / "src" / "lib",
+        tmp_path / ".autoflow",
+        tmp_path / "test" / "integration",
+    ]
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+
+    root_pid = compute_ccb_project_id(tmp_path)
+    for d in dirs[1:]:
+        assert compute_ccb_project_id(d) == root_pid, f"{d} got different project ID"
+
+
+def test_nested_ccb_stops_at_nearest_anchor(tmp_path: Path) -> None:
+    """When a subdirectory has its own .ccb/, it should be its own project root."""
+    (tmp_path / ".ccb").mkdir()
+    inner = tmp_path / "sub_project"
+    inner.mkdir()
+    (inner / ".ccb").mkdir()
+    deep = inner / "src"
+    deep.mkdir()
+
+    # inner and deep should resolve to inner, not tmp_path
+    assert find_project_root(inner) == inner
+    assert find_project_root(deep) == inner
+    assert find_project_root(tmp_path) == tmp_path
+
+    # Project IDs should differ between outer and inner projects
+    assert compute_ccb_project_id(tmp_path) != compute_ccb_project_id(inner)
+    # But inner and its subdirectory should match
+    assert compute_ccb_project_id(inner) == compute_ccb_project_id(deep)
