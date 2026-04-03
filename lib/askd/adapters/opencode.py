@@ -38,7 +38,7 @@ def _write_log(line: str) -> None:
     write_log(log_path(OASKD_SPEC.log_file_name), line)
 
 
-def _cancel_detection_enabled(default: bool = False) -> bool:
+def _cancel_detection_enabled(default: bool = True) -> bool:
     return env_bool("CCB_OASKD_CANCEL_DETECT", default)
 
 
@@ -157,16 +157,53 @@ class OpenCodeAdapter(BaseProviderAdapter):
         prompt = wrap_opencode_prompt(req.message, task.req_id)
         backend.send_text(pane_id, prompt)
 
-        # Verify prompt delivery: check pane received the text, retry once if not
+        # Verify prompt delivery: check pane received the text, retry once if not.
+        # If still not visible after retry, return hard failure (Pain Point #3).
+        # Use 50-line window (not 10) to reduce false negatives from fast-scrolling panes.
         time.sleep(0.5)
+        _delivery_ok = False
+        _VERIFY_LINES = 50
         try:
-            _pane_text = backend.get_text(pane_id, lines=10) or ""
-            if task.req_id not in _pane_text:
+            _pane_text = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
+            if task.req_id in _pane_text:
+                _delivery_ok = True
+            else:
                 _write_log(f"[WARN] Prompt may not be delivered, retrying send req_id={task.req_id}")
                 backend.send_text(pane_id, prompt)
-                time.sleep(0.5)
-        except Exception:
-            pass
+                time.sleep(1.0)
+                try:
+                    _pane_text2 = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
+                    _delivery_ok = task.req_id in _pane_text2
+                except Exception:
+                    pass
+        except Exception as _verify_err:
+            _write_log(f"[WARN] Delivery verification error: {_verify_err}")
+
+        if not _delivery_ok:
+            _write_log(f"[ERROR] Delivery verification failed after retry: req_id={task.req_id}")
+            notify_completion(
+                provider="opencode",
+                output_file=req.output_path,
+                reply="Delivery verification failed: prompt not visible in pane after retry",
+                req_id=task.req_id,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+                caller=req.caller,
+                email_req_id=req.email_req_id,
+                email_msg_id=req.email_msg_id,
+                email_from=req.email_from,
+                work_dir=req.work_dir,
+                caller_pane_id=req.caller_pane_id,
+                caller_terminal=req.caller_terminal,
+            )
+            return ProviderResult(
+                exit_code=1,
+                reply="Delivery verification failed: prompt not visible in pane after retry",
+                req_id=task.req_id,
+                session_key=session_key,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
 
         # Async mode: timeout_s == 0 means fire-and-forget
         if float(req.timeout_s) == 0.0:
@@ -187,6 +224,15 @@ class OpenCodeAdapter(BaseProviderAdapter):
 
         pane_check_interval = float(os.environ.get("CCB_OASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
+        _cancel_detect = _cancel_detection_enabled()
+        _cancel_check_interval = float(os.environ.get("CCB_OASKD_CANCEL_CHECK_INTERVAL", "5.0"))
+        _last_cancel_check = time.time()
+        _cancel_log_cursor = None
+        if _cancel_detect:
+            try:
+                _cancel_log_cursor = log_reader.open_cancel_log_cursor()
+            except Exception:
+                pass
 
         while True:
             # Check for cancellation
@@ -218,6 +264,24 @@ class OpenCodeAdapter(BaseProviderAdapter):
                         status=COMPLETION_STATUS_FAILED,
                     )
                 last_pane_check = time.time()
+
+            # Detect user interruption/abort (Pain Point #14).
+            # Uses existing detect_cancelled_since() from opencode_comm.py:1295.
+            if _cancel_detect and time.time() - _last_cancel_check >= _cancel_check_interval:
+                _last_cancel_check = time.time()
+                try:
+                    _was_cancelled, state = log_reader.detect_cancelled_since(state, req_id=task.req_id)
+                    if not _was_cancelled and _cancel_log_cursor is not None:
+                        _was_cancelled, _cancel_log_cursor = log_reader.detect_cancel_event_in_logs(
+                            _cancel_log_cursor, session_id=state.get("session_id", ""),
+                            since_epoch_s=started_ms / 1000.0,
+                        )
+                    if _was_cancelled:
+                        _write_log(f"[WARN] OpenCode request cancelled/aborted req_id={task.req_id}")
+                        task.cancelled = True
+                        break
+                except Exception as _cancel_err:
+                    _write_log(f"[WARN] Cancel detection error: {_cancel_err}")
 
             reply, state = log_reader.wait_for_message(state, wait_step)
             if not reply:

@@ -15,7 +15,9 @@ Arguments:
 import sys
 import os
 import subprocess
+import json as _json
 from pathlib import Path
+from typing import Optional
 
 script_dir = Path(__file__).resolve().parent
 
@@ -40,6 +42,57 @@ def _usage():
     print("  N    Show the latest N conversations (default: 1)", file=sys.stderr)
 
 
+def _check_pending_task(provider: str) -> Optional[str]:
+    """Check task_journal.jsonl for a running task that hasn't reached terminal state."""
+    # task_journal.jsonl lives in the CCB run directory (default ~/.cache/ccb/).
+    # Note: CCB_RUN_DIR is shared across projects. The journal stores provider + req_id
+    # but not project_id. This means we may warn about tasks from other projects.
+    # This is acceptable: a false warning ("task X still running") is far less harmful
+    # than showing stale results without any warning. If cross-project false positives
+    # become a problem, extend TaskJournal.record() to include project_id.
+    run_dir = os.environ.get("CCB_RUN_DIR", "")
+    if not run_dir:
+        run_dir = str(Path.home() / ".cache" / "ccb")
+    journal_path = Path(run_dir) / "task_journal.jsonl"
+    if not journal_path.exists():
+        return None
+
+    # Track latest state per (provider, req_id) — journal is append-only state transitions
+    terminal_states = {"completed", "failed", "cancelled", "expired"}
+    latest_by_req: dict[str, str] = {}
+    provider_reqs: list[tuple[str, float]] = []
+
+    try:
+        with journal_path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    entry = _json.loads(raw_line)
+                except _json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("provider", "")).lower() != provider:
+                    continue
+                req_id = str(entry.get("req_id", "")).strip()
+                state = str(entry.get("state", "")).strip().lower()
+                ts = float(entry.get("timestamp", 0))
+                if req_id:
+                    latest_by_req[req_id] = state
+                    provider_reqs.append((req_id, ts))
+    except Exception:
+        return None
+
+    # Find the most recent non-terminal task for this provider
+    for req_id, _ts in reversed(provider_reqs):
+        state = latest_by_req.get(req_id, "")
+        if state and state not in terminal_states:
+            return req_id
+    return None
+
+
 def main():
     if len(sys.argv) < 2:
         _usage()
@@ -55,6 +108,15 @@ def main():
         print(f"[ERROR] Unknown provider: {provider}", file=sys.stderr)
         print(f"[ERROR] Available: {', '.join(PROVIDER_PENDS.keys())}", file=sys.stderr)
         return 1
+
+    # Warn if there is a pending task that hasn't returned yet
+    pending_task = _check_pending_task(provider)
+    if pending_task:
+        print(
+            f"[WARN] Task {pending_task} is still running for {provider}. "
+            f"Result below may be from a PREVIOUS task.",
+            file=sys.stderr,
+        )
 
     # Get the original pend command
     pend_cmd = PROVIDER_PENDS[provider]

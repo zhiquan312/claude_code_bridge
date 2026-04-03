@@ -113,6 +113,7 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
 
     # Use ensure_pane() to handle stale bindings before sending /new
+    session = None  # May be populated by loader below; used for binding invalidation
     session_loaders = {
         "codex": ("caskd_session", "load_project_session"),
         "gemini": ("gaskd_session", "load_project_session"),
@@ -191,6 +192,31 @@ def main(argv: list[str]) -> int:
             if not recovered:
                 print(f"[ERROR] {provider} pane died and could not recover.", file=sys.stderr)
                 return EXIT_ERROR
+        # --- After successful send (normal or recovery path) ---
+        # Invalidate stale session log bindings so next /ask re-detects.
+        # Without this, askd reads old codex_session_id/codex_session_path
+        # from the session file and monitors a dead log (Pain Point #2).
+        if session is not None:
+            _invalidated = []
+            if provider == "codex":
+                for _key in ("codex_session_id", "codex_session_path"):
+                    if session.data.pop(_key, None) is not None:
+                        _invalidated.append(_key)
+            elif provider == "gemini":
+                for _key in ("gemini_session_path",):
+                    if session.data.pop(_key, None) is not None:
+                        _invalidated.append(_key)
+            elif provider == "opencode":
+                for _key in ("opencode_session_id",):
+                    if session.data.pop(_key, None) is not None:
+                        _invalidated.append(_key)
+            if _invalidated:
+                session.data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    session._write_back()
+                    print(f"[OK] Cleared stale bindings: {', '.join(_invalidated)}", file=sys.stderr)
+                except Exception as _wb_err:
+                    print(f"[WARN] Failed to clear stale bindings: {_wb_err}", file=sys.stderr)
         print(f"Sent {reset_cmd} to {provider} (pane: {pane_id})")
         return EXIT_OK
     except Exception as e:

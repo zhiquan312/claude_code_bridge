@@ -293,12 +293,24 @@ class AskDaemonServer:
         }
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         ok, _err = safe_write_session(self.state_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        if not ok:
+            write_log(
+                log_path(self.spec.log_file_name),
+                f"[ERROR] Failed to write daemon state to {self.state_file}: {_err}",
+            )
         if ok:
             if os.name != "nt":
                 try:
                     os.chmod(self.state_file, 0o600)
                 except Exception:
                     pass
+            # Write standalone PID file next to state file for safe process management.
+            # Allows `kill $(cat ~/.cache/ccb/askd.pid)` instead of fragile `pkill -f` (Pain Point #10).
+            _pid_file = self.state_file.parent / "askd.pid"
+            try:
+                _pid_file.write_text(str(os.getpid()))
+            except Exception:
+                pass
 
     def _write_persistent_state(self, status: str, exit_reason: str = "", exit_code: int = 0) -> None:
         """Write persistent state to askd.last.json for debugging and observability."""
@@ -319,6 +331,13 @@ class AskDaemonServer:
                     payload["exit_reason"] = exit_reason
                 if exit_code:
                     payload["exit_code"] = exit_code
+                # Clean up PID file on shutdown/crash only (NOT on heartbeat)
+                _pid_file = self.state_file.parent / "askd.pid"
+                try:
+                    if _pid_file.exists() and _pid_file.read_text().strip() == str(os.getpid()):
+                        _pid_file.unlink()
+                except Exception:
+                    pass
             try:
                 last_state_file.parent.mkdir(parents=True, exist_ok=True)
                 safe_write_session(last_state_file, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")

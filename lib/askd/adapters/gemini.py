@@ -173,16 +173,53 @@ class GeminiAdapter(BaseProviderAdapter):
         prompt = wrap_gemini_prompt(req.message, task.req_id)
         backend.send_text(pane_id, prompt)
 
-        # Verify prompt delivery: check pane received the text, retry once if not
+        # Verify prompt delivery: check pane received the text, retry once if not.
+        # If still not visible after retry, return hard failure (Pain Point #3).
+        # Use 50-line window (not 10) to reduce false negatives from fast-scrolling panes.
         time.sleep(0.5)
+        _delivery_ok = False
+        _VERIFY_LINES = 50
         try:
-            _pane_text = backend.get_text(pane_id, lines=10) or ""
-            if task.req_id not in _pane_text:
+            _pane_text = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
+            if task.req_id in _pane_text:
+                _delivery_ok = True
+            else:
                 _write_log(f"[WARN] Prompt may not be delivered, retrying send req_id={task.req_id}")
                 backend.send_text(pane_id, prompt)
-                time.sleep(0.5)
-        except Exception:
-            pass
+                time.sleep(1.0)
+                try:
+                    _pane_text2 = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
+                    _delivery_ok = task.req_id in _pane_text2
+                except Exception:
+                    pass
+        except Exception as _verify_err:
+            _write_log(f"[WARN] Delivery verification error: {_verify_err}")
+
+        if not _delivery_ok:
+            _write_log(f"[ERROR] Delivery verification failed after retry: req_id={task.req_id}")
+            notify_completion(
+                provider="gemini",
+                output_file=req.output_path,
+                reply="Delivery verification failed: prompt not visible in pane after retry",
+                req_id=task.req_id,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+                caller=req.caller,
+                email_req_id=req.email_req_id,
+                email_msg_id=req.email_msg_id,
+                email_from=req.email_from,
+                work_dir=req.work_dir,
+                caller_pane_id=req.caller_pane_id,
+                caller_terminal=req.caller_terminal,
+            )
+            return ProviderResult(
+                exit_code=1,
+                reply="Delivery verification failed: prompt not visible in pane after retry",
+                req_id=task.req_id,
+                session_key=session_key,
+                done_seen=False,
+                status=COMPLETION_STATUS_FAILED,
+            )
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
         done_seen = False
