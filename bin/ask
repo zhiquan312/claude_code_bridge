@@ -460,13 +460,14 @@ def _should_emit_async_guardrail(caller: str) -> bool:
     """
     Decide whether to print strict async guardrail text.
 
-    Override with CCB_ASK_EMIT_GUARDRAIL=0/1.
-    Default: enabled only when caller is Claude.
+    Override with CCB_ASK_EMIT_GUARDRAIL=1 to re-enable.
+    Default: OFF. Guardrail moved to skill level for parallel-dispatch awareness.
+    See Pain Points #6, #11.
     """
     raw = (os.environ.get("CCB_ASK_EMIT_GUARDRAIL") or "").strip().lower()
     if raw:
         return raw not in ("0", "false", "no", "off")
-    return (caller or "").strip().lower() == "claude"
+    return False
 
 
 def _require_caller() -> str:
@@ -747,6 +748,12 @@ exit $rc
         quoted_ask_cmd = shlex.quote(ask_cmd)
         quoted_provider = shlex.quote(provider)
         quoted_python = shlex.quote(sys.executable)
+        quoted_hook = shlex.quote(str(Path(__file__).resolve().parent / "ccb-completion-hook"))
+        _lib_dir_str = str(Path(__file__).resolve().parent.parent / "lib")
+        quoted_lib_dir = shlex.quote(_lib_dir_str)
+        # Python-safe repr for embedding in python -c one-liners
+        py_lib_dir = repr(_lib_dir_str)
+        quoted_log = shlex.quote(str(log_file))
         bg_script = f'''#!/bin/sh
 set +e
 _now() {{
@@ -765,6 +772,16 @@ echo "[CCB_TASK_END] task={task_id} provider={provider} exit_code=$rc"
 echo "$(_now) finished exit_code=$rc" >> {quoted_status}
 if [ "$rc" -ne 0 ]; then
   echo "$(_now) failed exit_code=$rc" >> {quoted_status}
+  # Notify caller of failure via completion hook (status via env, reply via stdin)
+  export CCB_COMPLETION_STATUS=failed
+  echo "Task {task_id} failed with exit code $rc. Log: {quoted_log}" | {quoted_python} {quoted_hook} --provider {provider} --caller {caller} --req-id "{task_id}" 2>/dev/null || true
+  unset CCB_COMPLETION_STATUS
+  # Update task_journal so pend --req-id reflects failure
+  {quoted_python} -c "
+import sys; sys.path.insert(0, {py_lib_dir})
+from task_journal import TaskJournal, TaskState
+TaskJournal().record('{task_id}', '{provider}', TaskState.FAILED, {{'reason': 'wrapper_exit', 'exit_code': $rc}})
+" 2>/dev/null || true
 fi
 exit "$rc"
 '''

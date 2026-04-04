@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -65,6 +67,217 @@ def _predismiss_codex_update_prompt(provider: str) -> None:
             version_file.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
+
+
+def _run_capture(cmd: list[str], timeout: float = 5.0) -> str:
+    try:
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        return cp.stdout or ""
+    except Exception:
+        return ""
+
+
+def _pkill_patterns(patterns: list[str]) -> int:
+    """Legacy pkill-based cleanup. Kept as fallback but prefer _kill_stale_tasks."""
+    killed = 0
+    for pattern in patterns:
+        try:
+            cp = subprocess.run(["pkill", "-f", pattern], check=False)
+            if cp.returncode == 0:
+                killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def _kill_stale_tasks(provider: str, work_dir: str = "", max_age_s: float = 0.0) -> int:
+    """Kill stale async task wrapper processes for a specific provider.
+
+    Scoped by: provider name, project work_dir, process age, excludes own process tree.
+    Uses os.killpg() to kill the entire process group (wrapper + child ask --foreground).
+    Linux/WSL only -- relies on .sh companion scripts and os.killpg().
+    """
+    import signal as _signal
+    killed = 0
+    task_dir = Path("/tmp/ccb-tasks")
+    if not task_dir.exists():
+        return 0
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    now = time.time()
+    for status_file in sorted(task_dir.glob(f"ask-{provider}-*.status")):
+        try:
+            file_age = now - status_file.stat().st_mtime
+            if max_age_s > 0 and file_age < max_age_s:
+                continue
+            text = status_file.read_text(encoding="utf-8", errors="replace")
+            if "finished" in text or "failed" in text:
+                continue
+            # Scope by work_dir: check the companion .sh script
+            if work_dir:
+                sh_file = status_file.with_suffix(".sh")
+                if sh_file.exists():
+                    sh_text = sh_file.read_text(encoding="utf-8", errors="replace")
+                    if work_dir not in sh_text:
+                        continue  # Different project, skip
+            for line in text.splitlines():
+                if "spawned pid=" in line:
+                    pid_str = line.split("spawned pid=")[1].strip().split()[0]
+                    pid = int(pid_str)
+                    if pid in (my_pid, my_ppid, 0, 1):
+                        continue
+                    try:
+                        os.kill(pid, 0)  # Check alive
+                        try:
+                            os.killpg(os.getpgid(pid), _signal.SIGTERM)
+                        except OSError:
+                            os.kill(pid, _signal.SIGTERM)
+                        killed += 1
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    return killed
+
+
+def _tmux_opencode_panes() -> list[dict]:
+    fmt = "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_title}"
+    out = _run_capture(["tmux", "list-panes", "-a", "-F", fmt], timeout=5)
+    panes: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("\t", 4)
+        if len(parts) < 5:
+            continue
+        pane_id, pane_pid, current_command, pane_dead, pane_title = parts
+        if current_command.strip() != "opencode":
+            continue
+        panes.append(
+            {
+                "pane_id": pane_id.strip(),
+                "pane_pid": pane_pid.strip(),
+                "pane_dead": pane_dead.strip(),
+                "pane_title": pane_title.strip(),
+            }
+        )
+    return panes
+
+
+def _pick_live_opencode_pane(backend, current_pane: str = "") -> str | None:
+    panes = _tmux_opencode_panes()
+    if not panes:
+        return None
+
+    scored: list[tuple[tuple[int, int, int], str]] = []
+    for pane in panes:
+        pane_id = pane["pane_id"]
+        try:
+            alive = bool(backend.is_alive(pane_id))
+        except Exception:
+            alive = False
+        if not alive or pane.get("pane_dead") == "1":
+            continue
+
+        title = pane.get("pane_title", "")
+        title_score = 1 if title else 0
+        if title.lower().startswith("opencode"):
+            title_score = 2
+
+        content = _run_capture(["tmux", "capture-pane", "-t", pane_id, "-p"], timeout=5)
+        content_score = 1 if content.strip() else 0
+        current_score = 1 if pane_id == current_pane else 0
+        pid_score = int(pane.get("pane_pid") or "0")
+        scored.append(((title_score, content_score, current_score, pid_score), pane_id))
+
+    if not scored:
+        return None
+
+    scored.sort()
+    return scored[-1][1]
+
+
+def _opencode_db_latest_session() -> tuple[str | None, int]:
+    db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    if not db_path.exists():
+        return None, 0
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT id, time_created FROM session ORDER BY time_created DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None, 0
+        return str(row[0]), int(row[1] or 0)
+    except Exception:
+        return None, 0
+
+
+def _opencode_wait_for_new_session(previous_ts: int, timeout_s: float = 15.0) -> str | None:
+    deadline = time.time() + timeout_s
+    latest_id = None
+    while time.time() < deadline:
+        sid, created = _opencode_db_latest_session()
+        if sid:
+            latest_id = sid
+        if sid and created > previous_ts:
+            return sid
+        time.sleep(0.5)
+    return latest_id
+
+
+def _update_opencode_session_file(session_file: Path, *, pane_id: str, opencode_session_id: str | None) -> None:
+    data = {}
+    if session_file.exists():
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8-sig"))
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["pane_id"] = pane_id
+    if opencode_session_id:
+        data["opencode_session_id"] = opencode_session_id
+    data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    session_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _handle_opencode_autonew(work_dir: Path, record: dict, provider_entry: dict, backend, pane_id: str) -> tuple[bool, str]:
+    killed_wrappers = _kill_stale_tasks("opencode", work_dir=str(work_dir))
+
+    live_pane = _pick_live_opencode_pane(backend, pane_id) or pane_id
+    if not live_pane:
+        return False, "No live OpenCode pane found"
+
+    before_sid, before_ts = _opencode_db_latest_session()
+
+    try:
+        backend.send_text(live_pane, "/new")
+    except Exception as exc:
+        return False, f"Failed to send /new: {exc}"
+
+    new_sid = _opencode_wait_for_new_session(before_ts, timeout_s=15.0)
+
+    session_file_path = str(provider_entry.get("session_file") or "").strip()
+    if not session_file_path:
+        session_file_path = str(work_dir / ".ccb" / ".opencode-session")
+    session_file = Path(session_file_path)
+    _update_opencode_session_file(session_file, pane_id=live_pane, opencode_session_id=new_sid or before_sid)
+
+    msg = (
+        f"OpenCode /new sent to {live_pane}; "
+        f"session_id={'unknown' if not (new_sid or before_sid) else (new_sid or before_sid)}; "
+        f"killed_wrappers={killed_wrappers}; askd_restart=0"
+    )
+    return True, msg
 
 
 def main(argv: list[str]) -> int:
@@ -156,6 +369,15 @@ def main(argv: list[str]) -> int:
         except Exception as e:
             print(f"[ERROR] Failed to check pane status: {e}", file=sys.stderr)
             return EXIT_ERROR
+
+    # OpenCode needs stronger session hygiene than the generic /new path.
+    if provider == "opencode":
+        ok, message = _handle_opencode_autonew(work_dir, record, provider_entry, backend, pane_id)
+        if not ok:
+            print(f"[ERROR] {message}", file=sys.stderr)
+            return EXIT_ERROR
+        print(message)
+        return EXIT_OK
 
     # Send reset command to the pane
     reset_cmd = PROVIDER_COMMANDS[provider]

@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import signal
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +64,21 @@ class DualBridge:
         self._running = True
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+
+        # Monitor owner CCB process -- auto-exit when owner dies (prevents zombie bridges)
+        owner_pid_str = os.environ.get("CCB_OWNER_PID", "").strip()
+        if owner_pid_str and owner_pid_str.isdigit():
+            owner_pid = int(owner_pid_str)
+            def _owner_monitor():
+                while self._running:
+                    try:
+                        os.kill(owner_pid, 0)
+                    except OSError:
+                        self._log_console(f"Owner PID {owner_pid} exited, bridge shutting down")
+                        self._running = False
+                        return
+                    time.sleep(5.0)
+            threading.Thread(target=_owner_monitor, daemon=True).start()
 
     def _handle_signal(self, signum: int, _: Any) -> None:
         self._running = False

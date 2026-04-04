@@ -53,8 +53,8 @@ if backend_env and not os.environ.get("CCB_BACKEND_ENV"):
     os.environ["CCB_BACKEND_ENV"] = backend_env
 
 VERSION = "5.2.9"
-GIT_COMMIT = "c539e79"
-GIT_DATE = "2026-02-25"
+GIT_COMMIT = "f42b787"
+GIT_DATE = "2026-04-01"
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:([/\\\\]|$)")
 _MNT_DRIVE_RE = re.compile(r"^/mnt/([A-Za-z])/(.*)$")
@@ -896,7 +896,7 @@ class AILauncher:
                         else:
                             _emit(f"✅ {spec.daemon_bin_name} already running")
                         return
-                    deadline = time.time() + 2.0
+                    deadline = time.time() + 3.0
                     while time.time() < deadline:
                         if not ping_daemon(timeout_s=0.2, state_file=state_file):
                             break
@@ -955,7 +955,7 @@ class AILauncher:
             _emit(f"⚠️ Failed to start {spec.daemon_bin_name}: {exc}")
             return
 
-        deadline = time.time() + 2.0
+        deadline = time.time() + 5.0
         while time.time() < deadline:
             if ping_daemon(timeout_s=0.2, state_file=state_file):
                 st = read_state(state_file=state_file) or {} if callable(read_state) else {}
@@ -2164,6 +2164,7 @@ class AILauncher:
         bridge_env["CODEX_INPUT_FIFO"] = str(input_fifo)
         bridge_env["CODEX_OUTPUT_FIFO"] = str(output_fifo)
         bridge_env["CODEX_TMUX_LOG"] = str(runtime / "bridge_output.log")
+        bridge_env["CCB_OWNER_PID"] = str(os.getpid())
         bridge_env["PYTHONPATH"] = str(self.script_dir) + os.pathsep + bridge_env.get("PYTHONPATH", "")
 
         try:
@@ -2458,6 +2459,7 @@ class AILauncher:
             bridge_env["CODEX_INPUT_FIFO"] = str(input_fifo)
             bridge_env["CODEX_OUTPUT_FIFO"] = str(output_fifo)
             bridge_env["CODEX_TMUX_LOG"] = str(runtime / "bridge_output.log")
+            bridge_env["CCB_OWNER_PID"] = str(os.getpid())
             bridge_env["PYTHONPATH"] = str(self.script_dir) + os.pathsep + bridge_env.get("PYTHONPATH", "")
 
             bridge_proc = subprocess.Popen(
