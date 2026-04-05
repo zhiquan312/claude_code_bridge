@@ -250,6 +250,70 @@ def _update_opencode_session_file(session_file: Path, *, pane_id: str, opencode_
     session_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _codex_latest_log(work_dir: Path) -> Path | None:
+    try:
+        from codex_comm import CodexLogReader
+
+        return CodexLogReader(log_path=None, session_id_filter=None, work_dir=work_dir).current_log_path()
+    except Exception:
+        return None
+
+
+def _codex_log_identity(log_path: Path | None) -> tuple[str, float]:
+    if not log_path:
+        return "", 0.0
+    try:
+        return str(log_path), float(log_path.stat().st_mtime)
+    except Exception:
+        return str(log_path), 0.0
+
+
+def _wait_for_new_codex_log(work_dir: Path, before_path: str, before_mtime: float, timeout_s: float = 15.0) -> Path | None:
+    deadline = time.time() + timeout_s
+    latest_seen: Path | None = None
+    while time.time() < deadline:
+        latest = _codex_latest_log(work_dir)
+        if latest:
+            latest_seen = latest
+            latest_path, latest_mtime = _codex_log_identity(latest)
+            if latest_path != before_path or latest_mtime > before_mtime:
+                return latest
+        time.sleep(0.5)
+    return latest_seen
+
+
+def _handle_codex_autonew(work_dir: Path, session, backend, pane_id: str) -> tuple[bool, str]:
+    before_log = _codex_latest_log(work_dir)
+    before_path, before_mtime = _codex_log_identity(before_log)
+
+    session.request_codex_refresh(clear_binding=False)
+
+    try:
+        backend.send_text(pane_id, "/new")
+    except Exception as exc:
+        return False, f"Failed to send /new: {exc}"
+
+    new_log = _wait_for_new_codex_log(work_dir, before_path, before_mtime, timeout_s=15.0)
+    if new_log:
+        try:
+            from codex_comm import CodexCommunicator
+
+            session_id = CodexCommunicator._extract_session_id(new_log)
+        except Exception:
+            session_id = None
+        session.update_codex_log_binding(log_path=str(new_log), session_id=session_id)
+        session.clear_codex_refresh_request()
+        return True, (
+            f"Codex /new sent to {pane_id}; rebound to "
+            f"{session_id or 'unknown-session'}"
+        )
+
+    session.request_codex_refresh(clear_binding=True)
+    return True, (
+        f"Codex /new sent to {pane_id}; waiting for next askd request to rebind session"
+    )
+
+
 def _handle_opencode_autonew(work_dir: Path, record: dict, provider_entry: dict, backend, pane_id: str) -> tuple[bool, str]:
     killed_wrappers = _kill_stale_tasks("opencode", work_dir=str(work_dir))
 
@@ -326,7 +390,6 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
 
     # Use ensure_pane() to handle stale bindings before sending /new
-    session = None  # May be populated by loader below; used for binding invalidation
     session_loaders = {
         "codex": ("caskd_session", "load_project_session"),
         "gemini": ("gaskd_session", "load_project_session"),
@@ -335,6 +398,7 @@ def main(argv: list[str]) -> int:
         "claude": ("laskd_session", "load_project_session"),
     }
     loader_info = session_loaders.get(provider)
+    session = None
     if loader_info:
         try:
             mod = __import__(loader_info[0])
@@ -379,6 +443,17 @@ def main(argv: list[str]) -> int:
         print(message)
         return EXIT_OK
 
+    if provider == "codex":
+        if session is None:
+            print("[ERROR] Codex session metadata unavailable; cannot refresh binding after /new.", file=sys.stderr)
+            return EXIT_ERROR
+        ok, message = _handle_codex_autonew(work_dir, session, backend, pane_id)
+        if not ok:
+            print(f"[ERROR] {message}", file=sys.stderr)
+            return EXIT_ERROR
+        print(message)
+        return EXIT_OK
+
     # Send reset command to the pane
     reset_cmd = PROVIDER_COMMANDS[provider]
     try:
@@ -414,31 +489,6 @@ def main(argv: list[str]) -> int:
             if not recovered:
                 print(f"[ERROR] {provider} pane died and could not recover.", file=sys.stderr)
                 return EXIT_ERROR
-        # --- After successful send (normal or recovery path) ---
-        # Invalidate stale session log bindings so next /ask re-detects.
-        # Without this, askd reads old codex_session_id/codex_session_path
-        # from the session file and monitors a dead log (Pain Point #2).
-        if session is not None:
-            _invalidated = []
-            if provider == "codex":
-                for _key in ("codex_session_id", "codex_session_path"):
-                    if session.data.pop(_key, None) is not None:
-                        _invalidated.append(_key)
-            elif provider == "gemini":
-                for _key in ("gemini_session_path",):
-                    if session.data.pop(_key, None) is not None:
-                        _invalidated.append(_key)
-            elif provider == "opencode":
-                for _key in ("opencode_session_id",):
-                    if session.data.pop(_key, None) is not None:
-                        _invalidated.append(_key)
-            if _invalidated:
-                session.data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                try:
-                    session._write_back()
-                    print(f"[OK] Cleared stale bindings: {', '.join(_invalidated)}", file=sys.stderr)
-                except Exception as _wb_err:
-                    print(f"[WARN] Failed to clear stale bindings: {_wb_err}", file=sys.stderr)
         print(f"Sent {reset_cmd} to {provider} (pane: {pane_id})")
         return EXIT_OK
     except Exception as e:

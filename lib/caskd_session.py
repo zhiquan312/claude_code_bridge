@@ -223,7 +223,31 @@ class CodexProjectSession:
             self.data["updated_at"] = _now_str()
             if self.data.get("active") is False:
                 self.data["active"] = True
+            self.data.pop("codex_refresh_requested_at", None)
             self._write_back()
+
+    def request_codex_refresh(self, *, clear_binding: bool = False) -> None:
+        self.data["codex_refresh_requested_at"] = _now_str()
+        self.data["updated_at"] = _now_str()
+        if clear_binding:
+            old_path = str(self.data.get("codex_session_path") or "").strip()
+            old_id = str(self.data.get("codex_session_id") or "").strip()
+            if old_id:
+                self.data["old_codex_session_id"] = old_id
+            if old_path:
+                self.data["old_codex_session_path"] = old_path
+            if old_path or old_id:
+                self.data["old_updated_at"] = _now_str()
+            self.data.pop("codex_session_path", None)
+            self.data.pop("codex_session_id", None)
+        self._write_back()
+
+    def clear_codex_refresh_request(self) -> None:
+        if "codex_refresh_requested_at" not in self.data:
+            return
+        self.data.pop("codex_refresh_requested_at", None)
+        self.data["updated_at"] = _now_str()
+        self._write_back()
 
     def _write_back(self) -> None:
         payload = json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"

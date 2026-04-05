@@ -68,6 +68,36 @@ def _is_log_stale(preferred: Optional[Path], latest: Optional[Path], threshold_s
     return latest_mtime - preferred_mtime >= threshold_s
 
 
+def _refresh_binding_if_needed(session: CodexProjectSession, *, force: bool) -> tuple[Optional[str], Optional[str], bool]:
+    current_log: Optional[Path] = None
+    if session.codex_session_path:
+        try:
+            current_log = Path(session.codex_session_path).expanduser()
+        except Exception:
+            current_log = None
+
+    latest_log = _scan_latest_any_log(Path(session.work_dir))
+    if not latest_log:
+        return session.codex_session_path or None, session.codex_session_id or None, False
+
+    should_switch = force or current_log is None or latest_log != current_log
+    if not should_switch:
+        return session.codex_session_path or None, session.codex_session_id or None, False
+
+    try:
+        new_session_id = CodexCommunicator._extract_session_id(latest_log)
+    except Exception:
+        new_session_id = None
+
+    try:
+        session.update_codex_log_binding(log_path=str(latest_log), session_id=new_session_id)
+        if force:
+            session.clear_codex_refresh_request()
+        return str(latest_log), new_session_id or None, True
+    except Exception:
+        return session.codex_session_path or None, session.codex_session_id or None, False
+
+
 class CodexAdapter(BaseProviderAdapter):
     """Adapter for Codex (WezTerm) provider."""
 
@@ -110,6 +140,14 @@ class CodexAdapter(BaseProviderAdapter):
                 status=COMPLETION_STATUS_FAILED,
             )
 
+        refresh_requested = bool(str(session.data.get("codex_refresh_requested_at") or "").strip())
+        preferred_log, codex_session_id, refreshed = _refresh_binding_if_needed(session, force=refresh_requested)
+        if refreshed:
+            _write_log(
+                f"[INFO] refreshed codex binding req_id={task.req_id} "
+                f"log={preferred_log or 'unknown'} session_id={codex_session_id or 'unknown'}"
+            )
+
         ok, pane_or_err = session.ensure_pane()
         if not ok:
             return ProviderResult(
@@ -134,8 +172,8 @@ class CodexAdapter(BaseProviderAdapter):
             )
 
         prompt = wrap_codex_prompt(req.message, task.req_id)
-        preferred_log = session.codex_session_path or None
-        codex_session_id = session.codex_session_id or None
+        preferred_log = session.codex_session_path or preferred_log or None
+        codex_session_id = session.codex_session_id or codex_session_id or None
         reader = CodexLogReader(
             log_path=preferred_log,
             session_id_filter=codex_session_id,
@@ -144,53 +182,16 @@ class CodexAdapter(BaseProviderAdapter):
         state = reader.capture_state()
         backend.send_text(pane_id, prompt)
 
-        # Verify prompt delivery: check pane received the text, retry once if not.
-        # If still not visible after retry, return hard failure (Pain Point #3).
-        # Use 50-line window (not 10) to reduce false negatives from fast-scrolling panes.
+        # Verify prompt delivery: check pane received the text, retry once if not
         time.sleep(0.5)
-        _delivery_ok = False
-        _VERIFY_LINES = 50
         try:
-            _pane_text = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
-            if task.req_id in _pane_text:
-                _delivery_ok = True
-            else:
+            _pane_text = backend.get_text(pane_id, lines=10) or ""
+            if task.req_id not in _pane_text:
                 _write_log(f"[WARN] Prompt may not be delivered, retrying send req_id={task.req_id}")
                 backend.send_text(pane_id, prompt)
-                time.sleep(1.0)
-                try:
-                    _pane_text2 = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
-                    _delivery_ok = task.req_id in _pane_text2
-                except Exception:
-                    pass
-        except Exception as _verify_err:
-            _write_log(f"[WARN] Delivery verification error: {_verify_err}")
-
-        if not _delivery_ok:
-            _write_log(f"[ERROR] Delivery verification failed after retry: req_id={task.req_id}")
-            notify_completion(
-                provider="codex",
-                output_file=req.output_path,
-                reply="Delivery verification failed: prompt not visible in pane after retry",
-                req_id=task.req_id,
-                done_seen=False,
-                status=COMPLETION_STATUS_FAILED,
-                caller=req.caller,
-                email_req_id=req.email_req_id,
-                email_msg_id=req.email_msg_id,
-                email_from=req.email_from,
-                work_dir=req.work_dir,
-                caller_pane_id=req.caller_pane_id,
-                caller_terminal=req.caller_terminal,
-            )
-            return ProviderResult(
-                exit_code=1,
-                reply="Delivery verification failed: prompt not visible in pane after retry",
-                req_id=task.req_id,
-                session_key=session_key,
-                done_seen=False,
-                status=COMPLETION_STATUS_FAILED,
-            )
+                time.sleep(0.5)
+        except Exception:
+            pass
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
         chunks: list[str] = []

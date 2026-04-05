@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import shlex
+import errno
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -964,6 +965,32 @@ class CodexCommunicator:
             raise RuntimeError("Terminal session not configured")
         self.backend.send_text(self.pane_id, content)
 
+    def _refresh_session_info(self) -> bool:
+        refreshed = self._load_session_info()
+        if not refreshed:
+            return False
+        self.session_info = refreshed
+        self.session_id = refreshed["session_id"]
+        self.runtime_dir = Path(refreshed["runtime_dir"])
+        self.input_fifo = Path(refreshed["input_fifo"])
+        self.terminal = refreshed.get("terminal", os.environ.get("CODEX_TERMINAL", "tmux"))
+        self.pane_id = get_pane_id_from_session(refreshed) or ""
+        self.pane_title_marker = refreshed.get("pane_title_marker") or ""
+        self.backend = get_backend_for_session(refreshed)
+        self.project_session_file = refreshed.get("_session_file")
+        self._invalidate_pane_health_cache()
+        self._log_reader = None
+        self._log_reader_primed = False
+        return True
+
+    def _send_via_fifo(self, payload: str) -> None:
+        data = payload.encode("utf-8")
+        fd = os.open(self.input_fifo, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+
     def _send_message(self, content: str) -> Tuple[str, Dict[str, Any]]:
         marker = self._generate_marker()
         message = {
@@ -974,13 +1001,27 @@ class CodexCommunicator:
 
         state = self.log_reader.capture_state()
 
-        # tmux mode drives bridge via FIFO; WezTerm mode injects text directly to pane
+        payload = json.dumps(message, ensure_ascii=False) + "\n"
+
+        # tmux mode prefers the bridge FIFO, but fall back to terminal injection
+        # when autonew or a pane reset leaves the old bridge/runtime stale.
         if self.terminal == "wezterm":
             self._send_via_terminal(content)
         else:
-            with open(self.input_fifo, "w", encoding="utf-8") as fifo:
-                fifo.write(json.dumps(message, ensure_ascii=False) + "\n")
-                fifo.flush()
+            last_error: Optional[Exception] = None
+            for attempt in range(2):
+                try:
+                    self._send_via_fifo(payload)
+                    last_error = None
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    no_reader = exc.errno in (errno.ENXIO, errno.ENOENT)
+                    if attempt == 0 and (no_reader or not self.input_fifo.exists()) and self._refresh_session_info():
+                        continue
+                    break
+            if last_error is not None:
+                self._send_via_terminal(content)
 
         return marker, state
 
