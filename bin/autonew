@@ -148,6 +148,94 @@ def _kill_stale_tasks(provider: str, work_dir: str = "", max_age_s: float = 0.0)
     return killed
 
 
+def _kill_stuck_askd_workers(provider: str, work_dir: str = "") -> int:
+    """Kill the askd worker holding this project's ProviderLock for *provider*.
+
+    After autonew, the old askd worker may still hold the fcntl lock on
+    ~/.ccb/run/{provider}-{hash}.lock, causing all new /ask requests to
+    queue behind it.  This function derives the exact lock file using the
+    same session-key logic the adapter uses, then kills the holder.
+
+    Currently only the OpenCode adapter uses ProviderLock (keyed by
+    "session:{provider}:{ccb_project_id}").  For other providers the
+    function is a harmless no-op.
+    """
+    import hashlib as _hashlib
+    import signal as _signal
+
+    lock_dir = Path.home() / ".ccb" / "run"
+    if not lock_dir.exists():
+        return 0
+
+    # Derive the exact lock file using the same scope as the adapter.
+    # OpenCode adapter: ProviderLock("opencode", cwd=f"session:{session_key}")
+    # where session_key = f"opencode:{ccb_project_id}"
+    wd = Path(work_dir or os.getcwd())
+    try:
+        project_id = compute_ccb_project_id(wd)
+    except Exception:
+        return 0
+
+    session_key = f"{provider}:{project_id}"
+    lock_cwd = f"session:{session_key}"
+    cwd_hash = _hashlib.md5(lock_cwd.encode()).hexdigest()[:8]
+    lock_file = lock_dir / f"{provider}-{cwd_hash}.lock"
+
+    if not lock_file.exists():
+        return 0
+
+    # Read the PID holding the lock
+    try:
+        content = lock_file.read_text(encoding="utf-8", errors="replace").strip()
+        if not content:
+            return 0
+        holder_pid = int(content)
+    except (ValueError, OSError):
+        return 0
+
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    if holder_pid in (my_pid, my_ppid, 0, 1):
+        return 0
+
+    # Check if holder is alive
+    try:
+        os.kill(holder_pid, 0)
+    except OSError:
+        # Dead PID -- clean up stale lock file
+        try:
+            lock_file.unlink()
+        except OSError:
+            pass
+        return 0
+
+    # Holder is alive -- kill it so new askd can take over
+    try:
+        os.kill(holder_pid, _signal.SIGTERM)
+    except OSError:
+        return 0
+
+    # Give it a moment, then force-kill if needed
+    time.sleep(0.5)
+    try:
+        os.kill(holder_pid, 0)  # Still alive?
+        os.kill(holder_pid, _signal.SIGKILL)
+    except OSError:
+        pass
+
+    # Only unlink if the file still contains the same PID we killed
+    # (avoids race where a new askd acquired the lock in the meantime)
+    time.sleep(0.2)
+    try:
+        current_content = lock_file.read_text(encoding="utf-8", errors="replace").strip()
+        if current_content and int(current_content) == holder_pid:
+            lock_file.unlink()
+    except (ValueError, OSError):
+        pass
+
+    return 1
+
+
 def _tmux_opencode_panes() -> list[dict]:
     fmt = "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_title}"
     out = _run_capture(["tmux", "list-panes", "-a", "-F", fmt], timeout=5)
@@ -283,6 +371,9 @@ def _wait_for_new_codex_log(work_dir: Path, before_path: str, before_mtime: floa
 
 
 def _handle_codex_autonew(work_dir: Path, session, backend, pane_id: str) -> tuple[bool, str]:
+    # Kill stuck askd workers holding the Codex provider lock
+    _kill_stuck_askd_workers("codex", work_dir=str(work_dir))
+
     before_log = _codex_latest_log(work_dir)
     before_path, before_mtime = _codex_log_identity(before_log)
 
@@ -316,6 +407,7 @@ def _handle_codex_autonew(work_dir: Path, session, backend, pane_id: str) -> tup
 
 def _handle_opencode_autonew(work_dir: Path, record: dict, provider_entry: dict, backend, pane_id: str) -> tuple[bool, str]:
     killed_wrappers = _kill_stale_tasks("opencode", work_dir=str(work_dir))
+    killed_askd = _kill_stuck_askd_workers("opencode", work_dir=str(work_dir))
 
     live_pane = _pick_live_opencode_pane(backend, pane_id) or pane_id
     if not live_pane:
@@ -339,7 +431,7 @@ def _handle_opencode_autonew(work_dir: Path, record: dict, provider_entry: dict,
     msg = (
         f"OpenCode /new sent to {live_pane}; "
         f"session_id={'unknown' if not (new_sid or before_sid) else (new_sid or before_sid)}; "
-        f"killed_wrappers={killed_wrappers}; askd_restart=0"
+        f"killed_wrappers={killed_wrappers}; killed_askd={killed_askd}"
     )
     return True, msg
 
@@ -453,6 +545,9 @@ def main(argv: list[str]) -> int:
             return EXIT_ERROR
         print(message)
         return EXIT_OK
+
+    # Kill stuck askd workers for any provider before sending /new
+    _kill_stuck_askd_workers(provider, work_dir=str(work_dir))
 
     # Send reset command to the pane
     reset_cmd = PROVIDER_COMMANDS[provider]
