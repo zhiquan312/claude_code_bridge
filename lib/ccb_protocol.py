@@ -10,11 +10,35 @@ BEGIN_PREFIX = "CCB_BEGIN:"
 DONE_PREFIX = "CCB_DONE:"
 
 DONE_LINE_RE_TEMPLATE = r"^\s*CCB_DONE:\s*{req_id}\s*$"
+_BOX_DRAWING_CHARS = "│╭╰╮╯─═┌┐└┘├┤┬┴┼╔╗╚╝║"
+_BOX_ONLY_LINE_RE = re.compile(rf"^[\s{re.escape(_BOX_DRAWING_CHARS)}]+$")
+_BOX_EDGE_RE = re.compile(rf"^[\s{re.escape(_BOX_DRAWING_CHARS)}]+|[\s{re.escape(_BOX_DRAWING_CHARS)}]+$")
 
 _TRAILING_DONE_TAG_RE = re.compile(
     r"^\s*(?!CCB_DONE\s*:)[A-Z][A-Z0-9_]*_DONE(?:\s*:\s*\d{8}-\d{6}-\d{3}-\d+-\d+)?\s*$"
 )
 _ANY_CCB_DONE_LINE_RE = re.compile(r"^\s*CCB_DONE:\s*\d{8}-\d{6}-\d{3}-\d+-\d+\s*$")
+
+
+def normalize_box_wrapped_text(text: str) -> str:
+    """
+    Normalize TUI box-wrapped text without disturbing interior content.
+
+    Gemini's terminal UI often renders assistant replies inside Unicode box
+    borders, e.g. `│  CCB_DONE: <req_id>  │`. Strip only leading/trailing box
+    runs and drop lines that are pure border art so marker matching can operate
+    on the semantic content.
+    """
+    out: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\n")
+        if not line:
+            out.append("")
+            continue
+        if _BOX_ONLY_LINE_RE.match(line):
+            continue
+        out.append(_BOX_EDGE_RE.sub("", line))
+    return "\n".join(out)
 
 
 def _is_trailing_noise_line(line: str) -> bool:

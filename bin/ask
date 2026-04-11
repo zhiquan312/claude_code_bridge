@@ -793,10 +793,19 @@ echo "[CCB_TASK_END] task={task_id} provider={provider} exit_code=$rc"
 echo "$(_now) finished exit_code=$rc" >> {quoted_status}
 if [ "$rc" -ne 0 ]; then
   echo "$(_now) failed exit_code=$rc" >> {quoted_status}
-  # Notify caller of failure via completion hook (status via env, reply via stdin)
-  export CCB_COMPLETION_STATUS=failed
-  echo "Task {task_id} failed with exit code $rc. Log: {quoted_log}" | {quoted_python} {quoted_hook} --provider {provider} --caller {caller} --req-id "{task_id}" 2>/dev/null || true
-  unset CCB_COMPLETION_STATUS
+  # Avoid duplicate terminal notifications when the provider adapter already
+  # reserved/emitted a completion hook for this req_id.
+  {quoted_python} -c "
+import sys; sys.path.insert(0, {py_lib_dir})
+from completion_hook import should_emit_wrapper_failure_hook
+raise SystemExit(0 if should_emit_wrapper_failure_hook('{provider}', '{task_id}') else 1)
+" 2>/dev/null
+  if [ "$?" -eq 0 ]; then
+    # Notify caller of failure via completion hook (status via env, reply via stdin)
+    export CCB_COMPLETION_STATUS=failed
+    echo \"Task {task_id} failed with exit code $rc. Log: {quoted_log}\" | {quoted_python} {quoted_hook} --provider {provider} --caller {caller} --req-id \"{task_id}\" 2>/dev/null || true
+    unset CCB_COMPLETION_STATUS
+  fi
   # Update task_journal so pend --req-id reflects failure
   {quoted_python} -c "
 import sys; sys.path.insert(0, {py_lib_dir})

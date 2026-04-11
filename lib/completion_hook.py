@@ -14,6 +14,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from askd_runtime import run_dir
+
 
 COMPLETION_STATUS_COMPLETED = "completed"
 COMPLETION_STATUS_CANCELLED = "cancelled"
@@ -40,6 +42,59 @@ COMPLETION_STATUS_MARKERS = {
     COMPLETION_STATUS_FAILED: "[CCB_TASK_FAILED]",
     COMPLETION_STATUS_INCOMPLETE: "[CCB_TASK_INCOMPLETE]",
 }
+
+
+def _completion_stamp_path(provider: str, req_id: str) -> Path:
+    safe_provider = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(provider or "unknown"))
+    safe_req_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(req_id or "unknown"))
+    return run_dir() / "completion-stamps" / safe_provider / f"{safe_req_id}.stamp"
+
+
+def completion_already_notified(provider: str, req_id: str) -> bool:
+    try:
+        return _completion_stamp_path(provider, req_id).exists()
+    except Exception:
+        return False
+
+
+def _reserve_completion_stamp(provider: str, req_id: str) -> bool:
+    try:
+        path = _completion_stamp_path(provider, req_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("sent\n")
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        # Fail-open: don't suppress a notification just because the stamp
+        # directory could not be written.
+        return True
+
+
+def should_emit_wrapper_failure_hook(provider: str, req_id: str) -> bool:
+    """
+    Guard generic wrapper-side failure hooks against duplicate terminal emits.
+
+    The provider adapter is the primary completion-hook authority. The shell
+    wrapper should only send its generic failed hook when no terminal hook has
+    already been reserved for this req_id.
+    """
+    try:
+        from task_journal import TaskJournal, TaskState
+
+        latest = TaskJournal().get_latest_state(req_id)
+        if latest in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.CANCELLED,
+            TaskState.EXPIRED,
+        } and completion_already_notified(provider, req_id):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def env_bool(name: str, default: bool = True) -> bool:
@@ -200,6 +255,8 @@ def notify_completion(
         status: Terminal status for notifications (completed/cancelled/failed/incomplete)
     """
     normalized_status = normalize_completion_status(status, done_seen=done_seen)
+    if not _reserve_completion_stamp(provider, req_id):
+        return
     _run_hook_async(
         provider,
         output_file,

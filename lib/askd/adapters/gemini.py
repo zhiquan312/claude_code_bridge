@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderResult, QueuedTask
 from askd_runtime import log_path, write_log
+from ccb_protocol import normalize_box_wrapped_text
 from completion_hook import (
     COMPLETION_STATUS_CANCELLED,
     COMPLETION_STATUS_COMPLETED,
@@ -38,6 +39,7 @@ def _write_log(line: str) -> None:
 
 _NO_REPLY_TIMEOUT_S = float(os.environ.get("CCB_GEMINI_NO_REPLY_TIMEOUT", "30.0"))
 _PROMPT_CHECK_LINES = int(os.environ.get("CCB_GEMINI_PROMPT_CHECK_LINES", "30"))
+_PANE_DONE_CHECK_LINES = int(os.environ.get("CCB_GEMINI_DONE_CHECK_LINES", "80"))
 
 
 def _is_cancel_text(text: str) -> bool:
@@ -100,6 +102,20 @@ def _detect_request_cancelled(session_path: Path, *, from_index: int, req_id: st
         if _cancel_applies_to_req(messages, i, req_id):
             return True
     return False
+
+
+def _capture_normalized_pane_text(backend: Any, pane_id: str, *, lines: int = _PANE_DONE_CHECK_LINES) -> str:
+    try:
+        return normalize_box_wrapped_text(backend.get_text(pane_id, lines=lines) or "")
+    except Exception:
+        return ""
+
+
+def _pane_done_reply(backend: Any, pane_id: str, req_id: str) -> str:
+    pane_text = _capture_normalized_pane_text(backend, pane_id)
+    if pane_text and is_done_text(pane_text, req_id):
+        return pane_text
+    return ""
 
 
 class GeminiAdapter(BaseProviderAdapter):
@@ -207,11 +223,13 @@ class GeminiAdapter(BaseProviderAdapter):
         pane_check_interval = float(os.environ.get("CCB_GASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
 
-        # Idle-timeout: if reply content stops changing for this many seconds,
-        # assume Gemini finished without writing CCB_DONE.
-        idle_timeout = float(os.environ.get("CCB_GEMINI_IDLE_TIMEOUT", "15.0"))
+        # Soft idle watchdog: log and rescan when Gemini appears stalled, but do
+        # not treat idle as completion without a confirmed marker.
+        idle_timeout = float(os.environ.get("CCB_GEMINI_IDLE_TIMEOUT", "90.0"))
         _last_reply_snapshot = ""
         _last_reply_changed_at = time.time()
+        stale_rescan_s = float(os.environ.get("CCB_GEMINI_STALE_SESSION_RESCAN_S", "10.0"))
+        _last_stale_rescan_at = time.time()
 
         while True:
             # Check for cancellation
@@ -270,9 +288,27 @@ class GeminiAdapter(BaseProviderAdapter):
                     break
 
             if not reply:
+                if stale_rescan_s > 0 and (time.time() - _last_stale_rescan_at) >= stale_rescan_s:
+                    try:
+                        refreshed = log_reader.capture_state()
+                        if refreshed.get("session_path") != state.get("session_path"):
+                            _write_log(
+                                f"[INFO] Gemini session rescan adopted newer log "
+                                f"req_id={task.req_id} session={refreshed.get('session_path')}"
+                            )
+                        state = refreshed
+                    except Exception:
+                        pass
+                    _last_stale_rescan_at = time.time()
                 if _NO_REPLY_TIMEOUT_S > 0 and not latest_reply:
                     no_reply_elapsed = time.time() - prompt_sent_at
                     if no_reply_elapsed >= _NO_REPLY_TIMEOUT_S:
+                        pane_reply = _pane_done_reply(backend, pane_id, task.req_id)
+                        if pane_reply:
+                            latest_reply = pane_reply
+                            done_seen = True
+                            done_ms = _now_ms() - started_ms
+                            break
                         if prompt_verified:
                             _write_log(
                                 f"[WARN] Gemini produced no reply within {_NO_REPLY_TIMEOUT_S:.1f}s "
@@ -286,25 +322,41 @@ class GeminiAdapter(BaseProviderAdapter):
                         break
                 continue
             latest_reply = str(reply)
-            if is_done_text(latest_reply, task.req_id):
+            normalized_reply = normalize_box_wrapped_text(latest_reply)
+            if is_done_text(normalized_reply, task.req_id):
+                latest_reply = normalized_reply
                 done_seen = True
                 done_ms = _now_ms() - started_ms
                 break
 
-            # Idle-timeout: detect when Gemini finished but forgot CCB_DONE
-            if latest_reply != _last_reply_snapshot:
-                _last_reply_snapshot = latest_reply
+            if normalized_reply != _last_reply_snapshot:
+                _last_reply_snapshot = normalized_reply
                 _last_reply_changed_at = time.time()
-            elif latest_reply and (time.time() - _last_reply_changed_at >= idle_timeout):
+            elif normalized_reply and idle_timeout > 0 and (time.time() - _last_reply_changed_at >= idle_timeout):
+                pane_reply = _pane_done_reply(backend, pane_id, task.req_id)
+                if pane_reply:
+                    latest_reply = pane_reply
+                    done_seen = True
+                    done_ms = _now_ms() - started_ms
+                    break
                 _write_log(
-                    f"[WARN] Gemini reply idle for {idle_timeout}s without CCB_DONE, "
-                    f"accepting as complete req_id={task.req_id}"
+                    f"[WARN] Gemini reply idle for {idle_timeout}s without CCB_DONE "
+                    f"req_id={task.req_id}; continuing to wait"
                 )
+                try:
+                    state = log_reader.capture_state()
+                except Exception:
+                    pass
+                _last_reply_changed_at = time.time()
+
+        if not done_seen:
+            pane_reply = _pane_done_reply(backend, pane_id, task.req_id)
+            if pane_reply:
+                latest_reply = pane_reply
                 done_seen = True
                 done_ms = _now_ms() - started_ms
-                break
 
-        final_reply = extract_reply_for_req(latest_reply, task.req_id)
+        final_reply = extract_reply_for_req(normalize_box_wrapped_text(latest_reply), task.req_id)
         status = COMPLETION_STATUS_COMPLETED if done_seen else COMPLETION_STATUS_INCOMPLETE
         if request_cancelled or task.cancelled:
             status = COMPLETION_STATUS_CANCELLED

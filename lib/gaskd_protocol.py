@@ -6,13 +6,18 @@ from dataclasses import dataclass
 from ccb_protocol import (
     DONE_PREFIX,
     REQ_ID_PREFIX,
-    is_done_text,
+    is_done_text as _is_done_text,
     make_req_id,
+    normalize_box_wrapped_text,
     strip_done_text,
 )
 
 # Match both old (32-char hex) and new (YYYYMMDD-HHMMSS-mmm-PID-counter) req_id formats
 ANY_DONE_LINE_RE = re.compile(r"^\s*CCB_DONE:\s*(?:[0-9a-f]{32}|\d{8}-\d{6}-\d{3}-\d+-\d+)\s*$", re.IGNORECASE)
+
+
+def is_done_text(text: str, req_id: str) -> bool:
+    return _is_done_text(normalize_box_wrapped_text(text), req_id)
 
 
 def wrap_gemini_prompt(message: str, req_id: str) -> str:
@@ -36,6 +41,7 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     `CCB_DONE: <req_id>` line. In that case, we want only the segment between the previous done line
     (any req_id) and the done line for our req_id.
     """
+    text = normalize_box_wrapped_text(text)
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     if not lines:
         return ""
