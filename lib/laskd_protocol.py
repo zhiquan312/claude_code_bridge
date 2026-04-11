@@ -86,13 +86,27 @@ def _visible_line_indices(lines: list[str]) -> set[int]:
     req_id.
     """
     visible: set[int] = set()
-    in_fence = False
+    # Track WHICH fence opened the block so a ~~~ line inside a ``` fence
+    # (or vice versa) cannot falsely close it. Per CommonMark the closing
+    # fence must use the same character family as the opener.
+    fence_char: str | None = None
     for i, ln in enumerate(lines):
         stripped = ln.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
+        if fence_char is None:
+            if stripped.startswith("```"):
+                fence_char = "`"
+                continue
+            if stripped.startswith("~~~"):
+                fence_char = "~"
+                continue
+        else:
+            if fence_char == "`" and stripped.startswith("```"):
+                fence_char = None
+                continue
+            if fence_char == "~" and stripped.startswith("~~~"):
+                fence_char = None
+                continue
+            # Any other line inside an open fence is hidden.
             continue
         # Indented code block: 4+ spaces OR starts with a tab
         if ln.startswith("    ") or ln.startswith("\t"):

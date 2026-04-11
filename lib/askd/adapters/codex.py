@@ -68,6 +68,44 @@ def _is_log_stale(preferred: Optional[Path], latest: Optional[Path], threshold_s
     return latest_mtime - preferred_mtime >= threshold_s
 
 
+def _wait_if_mcp_booting(backend, pane_id: str, *, req_id: str) -> None:
+    """Targeted readiness check: only waits if the pane is ACTIVELY booting MCP.
+
+    Unlike the old blanket 30s wait, this inspects the pane tail once. If the
+    "Booting MCP server:" banner is visible AND no codex prompt (">") is yet
+    rendered, we poll up to CCB_CODEX_MCP_BOOT_WAIT_SECS seconds (default 90)
+    for the banner to clear. If the banner is not present, we return
+    immediately -- the hot path stays fast for normal traffic.
+
+    This protects askd traffic outside codex-switch from racing a cold MCP
+    boot, without adding latency to warm panes.
+    """
+    try:
+        max_wait = float(os.environ.get("CCB_CODEX_MCP_BOOT_WAIT_SECS", "90"))
+    except Exception:
+        max_wait = 90.0
+    if max_wait <= 0:
+        return
+    try:
+        tail = backend.get_text(pane_id, lines=30) or ""
+    except Exception:
+        return
+    if "Booting MCP server:" not in tail:
+        return
+    _write_log(f"[INFO] codex pane {pane_id} is booting MCP; waiting up to {max_wait:.0f}s req_id={req_id}")
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        time.sleep(1.0)
+        try:
+            tail = backend.get_text(pane_id, lines=30) or ""
+        except Exception:
+            continue
+        if "Booting MCP server:" not in tail:
+            _write_log(f"[INFO] codex pane {pane_id} MCP boot cleared req_id={req_id}")
+            return
+    _write_log(f"[WARN] codex pane {pane_id} MCP still booting after {max_wait:.0f}s; sending anyway req_id={req_id}")
+
+
 def _refresh_binding_if_needed(session: CodexProjectSession, *, force: bool) -> tuple[Optional[str], Optional[str], bool]:
     current_log: Optional[Path] = None
     if session.codex_session_path:
@@ -180,6 +218,11 @@ class CodexAdapter(BaseProviderAdapter):
             work_dir=Path(session.work_dir),
         )
         state = reader.capture_state()
+
+        # If the pane is in the middle of an MCP cold boot, wait for the
+        # banner to clear before sending. Returns immediately on warm panes.
+        _wait_if_mcp_booting(backend, pane_id, req_id=task.req_id)
+
         backend.send_text(pane_id, prompt)
 
         # Verify prompt delivery: check pane received the text, retry once if not

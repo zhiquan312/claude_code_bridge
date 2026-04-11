@@ -9,11 +9,11 @@ at the dead process. This command atomically:
   1. Finds the project's .ccb/.codex-session via cwd walk-up
   2. Verifies the tracked pane_id is still alive (tmux list-panes)
   3. Extracts the new codex session id from the live pane content
-     (looks for 'codex resume <session-id>' banner) or via git session path
-  4. Finds the new codex PID (child of pane bash)
+     by scanning for the 'codex resume <session-id>' banner in scrollback
+  4. Finds the new codex PID by walking the pane's process tree
   5. Updates .ccb/.codex-session codex_session_id + old_codex_session_id
-  6. Updates runtime_dir/codex.pid with the new pid
-  7. Triggers request_codex_refresh so the next Codex ask consumes it
+     atomically (temp file + rename)
+  6. Updates runtime_dir/codex.pid with the new pid (atomically)
 
 Usage:
     ccb-rebind                # rebind current project's codex pane
@@ -21,11 +21,13 @@ Usage:
     ccb-rebind --verbose      # print intermediate steps
 
 Exit codes:
-    0  rebound successfully
-    1  no .ccb/.codex-session found from cwd
+    0  rebound successfully (new session id written AND, if a runtime
+       codex.pid file was expected, new pid written)
+    1  no .ccb/.codex-session found from cwd, or session file unparseable
     2  pane id missing or tmux not available
     3  pane dead or not responding
     4  could not extract new session id from pane
+    5  could not locate new codex pid under the pane bash process tree
 """
 
 from __future__ import annotations
@@ -227,8 +229,20 @@ def main() -> int:
         pid_tmp = codex_pid_file.with_suffix(codex_pid_file.suffix + ".tmp")
         pid_tmp.write_text(new_pid + "\n")
         pid_tmp.replace(codex_pid_file)
+    elif codex_pid_file and not new_pid:
+        # Session file was updated, but we could not locate the new codex
+        # process under the pane bash. Report failure so callers (and users)
+        # know the rebind is NOT complete -- askd's runtime still points at
+        # whatever old pid is recorded, which may be dead.
+        print(
+            f"[ERROR] ccb-rebind: session_id updated to {new_sid} but could "
+            f"not find a running codex process under pane {pane_id} "
+            f"(pane_pid={pp or '?'}); codex.pid NOT refreshed",
+            file=sys.stderr,
+        )
+        return 5
 
-    print(f"[OK] ccb-rebind: pane={pane_id} session_id={new_sid} pid={new_pid or '?'}")
+    print(f"[OK] ccb-rebind: pane={pane_id} session_id={new_sid} pid={new_pid or 'n/a'}")
     return 0
 
 
