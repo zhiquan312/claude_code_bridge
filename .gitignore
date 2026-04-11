@@ -2,6 +2,23 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+
+# Secrets and credentials
+.env
+.env.*
+*.env
+!.env.example
+*.enc
+credentials.enc
+*.pem
+*.key
+secrets.json
+service_account.json
+aws_*.json
+gcp_*.json
+.idea/
+.vscode/
+
 docs/
 !docs/**/*.md
 tests/

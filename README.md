@@ -34,6 +34,12 @@
 
 ---
 
+> **Fork Notice**
+>
+> This is a fork of the original claude_code_bridge project. I maintain this fork to apply small fixes and personal adjustments while I use the tool day-to-day. Original attribution and contact information is preserved throughout. Feel free to fork this again, modify it, or contribute back to the upstream project -- whatever works for you.
+
+---
+
 **Introduction:** Multi-model collaboration avoids model bias, cognitive blind spots, and context limits. Unlike MCP or API-based approaches, ccb gives you a WYSIWYG split-pane terminal where every interaction is visible and every model is controllable.
 
 ## ⚡ Why ccb?

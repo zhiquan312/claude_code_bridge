@@ -17,7 +17,7 @@ def _extract_email(addr: str) -> str:
     """Extract pure email address from a potentially MIME-encoded address.
 
     Examples:
-        '=?utf-8?B?5YiY5Yip?= <bfly123@126.com>' -> 'bfly123@126.com'
+        '=?utf-8?B?5YiY5Yip?= <user@example.com>' -> 'user@example.com'
         'John Doe <john@example.com>' -> 'john@example.com'
         'john@example.com' -> 'john@example.com'
     """
