@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+ccb-rebind -- explicit session rebind after a bare tmux pane respawn.
+
+After `tmux respawn-pane -k` + `codex ...` restart, the .ccb/.codex-session
+file still holds the old session id and the runtime codex.pid still points
+at the dead process. This command atomically:
+
+  1. Finds the project's .ccb/.codex-session via cwd walk-up
+  2. Verifies the tracked pane_id is still alive (tmux list-panes)
+  3. Extracts the new codex session id from the live pane content
+     (looks for 'codex resume <session-id>' banner) or via git session path
+  4. Finds the new codex PID (child of pane bash)
+  5. Updates .ccb/.codex-session codex_session_id + old_codex_session_id
+  6. Updates runtime_dir/codex.pid with the new pid
+  7. Triggers request_codex_refresh so the next Codex ask consumes it
+
+Usage:
+    ccb-rebind                # rebind current project's codex pane
+    ccb-rebind --dry-run      # show what would change
+    ccb-rebind --verbose      # print intermediate steps
+
+Exit codes:
+    0  rebound successfully
+    1  no .ccb/.codex-session found from cwd
+    2  pane id missing or tmux not available
+    3  pane dead or not responding
+    4  could not extract new session id from pane
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+SESSION_ID_RE = re.compile(r"codex resume\s+([0-9a-f][0-9a-f\-]{10,})", re.IGNORECASE)
+
+
+def _log(msg: str, *, verbose: bool) -> None:
+    if verbose:
+        print(msg, file=sys.stderr)
+
+
+def _find_ccb_dir(start: Path) -> Path | None:
+    cur = start.resolve()
+    for candidate in [cur, *cur.parents]:
+        ccb = candidate / ".ccb"
+        if ccb.is_dir() and (ccb / ".codex-session").is_file():
+            return ccb
+    return None
+
+
+def _run(cmd: list[str]) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return p.returncode, p.stdout, p.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return 1, "", str(exc)
+
+
+def _pane_alive(pane_id: str) -> bool:
+    rc, out, _ = _run(["tmux", "list-panes", "-a", "-F", "#{pane_id}"])
+    if rc != 0:
+        return False
+    return pane_id in out.splitlines()
+
+
+def _capture_pane(pane_id: str, lines: int = 200) -> str:
+    rc, out, _ = _run(["tmux", "capture-pane", "-t", pane_id, "-p", "-S", f"-{lines}"])
+    return out if rc == 0 else ""
+
+
+def _pane_pid(pane_id: str) -> str | None:
+    rc, out, _ = _run(["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"])
+    return out.strip() if rc == 0 else None
+
+
+def _extract_session_id(pane_text: str) -> str | None:
+    # Prefer the MOST RECENT (last) "codex resume <sid>" line because old sessions
+    # may still appear higher up in scrollback after respawn.
+    matches = SESSION_ID_RE.findall(pane_text)
+    return matches[-1] if matches else None
+
+
+def _find_codex_pid(pane_pid: str) -> str | None:
+    # Look for the newest codex process whose ancestor is the pane bash.
+    rc, out, _ = _run(["pgrep", "-P", pane_pid])
+    if rc != 0 or not out.strip():
+        return None
+    for child_pid in out.strip().split():
+        # Walk children to find a codex binary
+        rc2, cmd, _ = _run(["ps", "-p", child_pid, "-o", "cmd="])
+        if rc2 == 0 and ("codex" in cmd or "codex-linux-x64" in cmd or "bin/codex" in cmd):
+            return child_pid
+        # Walk one more level for the node -> rust wrapper case
+        rc3, grand, _ = _run(["pgrep", "-P", child_pid])
+        if rc3 == 0 and grand.strip():
+            for g in grand.strip().split():
+                rc4, gcmd, _ = _run(["ps", "-p", g, "-o", "cmd="])
+                if rc4 == 0 and ("codex" in gcmd or "codex-linux-x64" in gcmd):
+                    return g
+    # Fallback: any pgrep child
+    return out.strip().split()[0]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Rebind Codex pane after respawn")
+    parser.add_argument("--dry-run", action="store_true", help="show changes without writing")
+    parser.add_argument("--verbose", "-v", action="store_true", help="print progress")
+    parser.add_argument("--pane", help="override pane id")
+    parser.add_argument("--retries", type=int, default=5, help="poll attempts for session id")
+    args = parser.parse_args()
+
+    ccb_dir = _find_ccb_dir(Path.cwd())
+    if not ccb_dir:
+        print("error: no .ccb/.codex-session found walking up from cwd", file=sys.stderr)
+        return 1
+
+    session_file = ccb_dir / ".codex-session"
+    try:
+        data = json.loads(session_file.read_text())
+    except Exception as exc:
+        print(f"error: cannot parse {session_file}: {exc}", file=sys.stderr)
+        return 1
+
+    pane_id = args.pane or str(data.get("pane_id") or "").strip()
+    if not pane_id:
+        print(f"error: no pane_id in {session_file}", file=sys.stderr)
+        return 2
+
+    _log(f"[info] ccb_dir={ccb_dir} pane_id={pane_id}", verbose=args.verbose)
+
+    if not _pane_alive(pane_id):
+        print(f"error: pane {pane_id} is not alive (dead or missing)", file=sys.stderr)
+        return 3
+
+    # Poll for the new session id (pane may still be booting codex after respawn)
+    new_sid: str | None = None
+    for attempt in range(max(1, args.retries)):
+        pane_text = _capture_pane(pane_id, lines=200)
+        new_sid = _extract_session_id(pane_text)
+        if new_sid:
+            break
+        _log(f"[info] attempt {attempt + 1}/{args.retries}: no session id yet", verbose=args.verbose)
+        time.sleep(1.0)
+
+    if not new_sid:
+        print(f"error: could not find 'codex resume <sid>' in pane {pane_id} scrollback", file=sys.stderr)
+        return 4
+
+    old_sid = str(data.get("codex_session_id") or "").strip()
+    _log(f"[info] old_sid={old_sid} new_sid={new_sid}", verbose=args.verbose)
+
+    pp = _pane_pid(pane_id)
+    new_pid = _find_codex_pid(pp) if pp else None
+    _log(f"[info] pane_pid={pp} new_codex_pid={new_pid}", verbose=args.verbose)
+
+    runtime_dir = Path(str(data.get("runtime_dir") or ""))
+    codex_pid_file = runtime_dir / "codex.pid" if runtime_dir.is_absolute() else None
+
+    changes = {
+        "session_file": str(session_file),
+        "old_codex_session_id": old_sid or None,
+        "new_codex_session_id": new_sid,
+        "new_codex_pid": new_pid,
+        "codex_pid_file": str(codex_pid_file) if codex_pid_file else None,
+    }
+
+    if args.dry_run:
+        print(json.dumps(changes, indent=2))
+        return 0
+
+    # Apply updates
+    if old_sid and old_sid != new_sid:
+        data["old_codex_session_id"] = old_sid
+    data["codex_session_id"] = new_sid
+    # Trigger refresh signal so next Codex ask re-reads the binding
+    data["codex_refresh_requested_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    session_file.write_text(json.dumps(data, indent=2) + "\n")
+
+    if codex_pid_file and new_pid:
+        codex_pid_file.write_text(new_pid)
+
+    print(f"[OK] ccb-rebind: pane={pane_id} session_id={new_sid} pid={new_pid or '?'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

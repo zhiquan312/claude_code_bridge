@@ -74,6 +74,33 @@ def _load_claude_skills() -> str:
     return _SKILL_CACHE
 
 
+def _visible_line_indices(lines: list[str]) -> set[int]:
+    """
+    Return the set of line indices that are "visible" for CCB marker parsing.
+
+    Lines INSIDE markdown fenced code blocks (``` ... ```), block quotes (>),
+    or indented code blocks (4+ leading spaces) are EXCLUDED. This prevents
+    CCB_BEGIN / CCB_DONE markers that appear inline in Claude chat output
+    (e.g., when Claude is quoting a refusal or demonstrating a template) from
+    being mistakenly parsed as a valid reply for a pending req_id.
+    """
+    visible: set[int] = set()
+    in_fence = False
+    for i, ln in enumerate(lines):
+        stripped = ln.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if ln.startswith("    "):  # 4-space indented code block
+            continue
+        if stripped.startswith(">"):  # markdown block quote
+            continue
+        visible.add(i)
+    return visible
+
+
 def extract_reply_for_req(text: str, req_id: str) -> str:
     """
     Extract the reply segment for req_id from a Claude message.
@@ -81,15 +108,23 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     Claude sometimes emits multiple replies in a single assistant message, each ending with its own
     `CCB_DONE: <req_id>` line. In that case, we want only the segment between the previous done line
     (any req_id) and the done line for our req_id.
+
+    CCB markers inside markdown fenced/indented/quoted blocks are ignored so inline
+    template demonstrations or quoted refusals do not accidentally satisfy a req_id.
     """
     lines = [ln.rstrip("\n") for ln in (text or "").splitlines()]
     if not lines:
         return ""
 
+    visible = _visible_line_indices(lines)
+
     # Find last done-line index for this req_id (may not be last line if the model misbehaves).
     target_re = re.compile(rf"^\s*CCB_DONE:\s*{re.escape(req_id)}\s*$", re.IGNORECASE)
     begin_re = re.compile(rf"^\s*{re.escape(BEGIN_PREFIX)}\s*{re.escape(req_id)}\s*$", re.IGNORECASE)
-    done_idxs = [i for i, ln in enumerate(lines) if ANY_DONE_LINE_RE.match(ln or "")]
+    done_idxs = [
+        i for i, ln in enumerate(lines)
+        if i in visible and ANY_DONE_LINE_RE.match(ln or "")
+    ]
     target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
 
     if not target_idxs:

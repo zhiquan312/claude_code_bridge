@@ -28,6 +28,19 @@ CACHE_TTL_S = int(os.environ.get("CCB_DELEGATION_TTL_S") or str(60 * 60 * 24))
 # Detect caller from environment, default to "droid" for factory/droid MCP
 CCB_CALLER = os.environ.get("CCB_CALLER", "droid")
 
+# Session-wide provider denylist. If set, the named providers will not be
+# exposed as ccb_ask_* / ccb_pend_* / ccb_ping_* tools in this MCP session.
+# This is the hard fix for the Issue A "sub-agent calls ask_claude on a
+# validator task" bug: run the Codex pane with
+#   CCB_MCP_HIDE_PROVIDERS=claude,gemini,opencode
+# and Codex sub-agents will not have those tools to call in the first place.
+# Format: comma-separated provider keys (e.g. "claude,opencode").
+HIDE_PROVIDERS = {
+    p.strip().lower()
+    for p in (os.environ.get("CCB_MCP_HIDE_PROVIDERS") or "").split(",")
+    if p.strip()
+}
+
 PROVIDERS = {
     "codex": {"ask": "cask", "pend": "cpend", "ping": "cping"},
     "gemini": {"ask": "gask", "pend": "gpend", "ping": "gping"},
@@ -106,6 +119,8 @@ def _ping_schema() -> dict[str, Any]:
 
 TOOL_DEFS = []
 for provider in ("codex", "gemini", "claude", "opencode"):
+    if provider in HIDE_PROVIDERS:
+        continue
     TOOL_DEFS.append(
         {
             "name": f"ccb_ask_{provider}",
@@ -129,6 +144,8 @@ for provider in ("codex", "gemini", "claude", "opencode"):
     )
 
 for alias, provider, kind in ALIAS_TOOLS:
+    if provider in HIDE_PROVIDERS:
+        continue
     if kind == "ask":
         schema = _ask_schema()
     elif kind == "pend":
@@ -433,6 +450,13 @@ def _ping_provider(provider: str, args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     alias = ALIAS_MAP.get(name)
+    # Runtime block: even if an old tool reference was cached before the
+    # server enforced HIDE_PROVIDERS (e.g. long-lived chat session), refuse
+    # the call at dispatch time.
+    if alias and alias[0] in HIDE_PROVIDERS:
+        return _tool_error(
+            f"tool disabled for provider: {alias[0]} (CCB_MCP_HIDE_PROVIDERS)"
+        )
     if alias:
         provider, kind = alias
         if kind == "ask":
@@ -446,6 +470,10 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
     provider = _resolve_provider(name)
     if not provider or provider not in PROVIDERS:
         return _tool_error(f"unknown tool: {name}")
+    if provider in HIDE_PROVIDERS:
+        return _tool_error(
+            f"tool disabled for provider: {provider} (CCB_MCP_HIDE_PROVIDERS)"
+        )
     if name.startswith("ccb_ask_"):
         return _submit_task(provider, args)
     if name.startswith("ccb_pend_"):
