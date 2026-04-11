@@ -236,61 +236,6 @@ def _kill_stuck_askd_workers(provider: str, work_dir: str = "") -> int:
     return 1
 
 
-def _tmux_opencode_panes() -> list[dict]:
-    fmt = "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_title}"
-    out = _run_capture(["tmux", "list-panes", "-a", "-F", fmt], timeout=5)
-    panes: list[dict] = []
-    for line in out.splitlines():
-        parts = line.split("\t", 4)
-        if len(parts) < 5:
-            continue
-        pane_id, pane_pid, current_command, pane_dead, pane_title = parts
-        if current_command.strip() != "opencode":
-            continue
-        panes.append(
-            {
-                "pane_id": pane_id.strip(),
-                "pane_pid": pane_pid.strip(),
-                "pane_dead": pane_dead.strip(),
-                "pane_title": pane_title.strip(),
-            }
-        )
-    return panes
-
-
-def _pick_live_opencode_pane(backend, current_pane: str = "") -> str | None:
-    panes = _tmux_opencode_panes()
-    if not panes:
-        return None
-
-    scored: list[tuple[tuple[int, int, int], str]] = []
-    for pane in panes:
-        pane_id = pane["pane_id"]
-        try:
-            alive = bool(backend.is_alive(pane_id))
-        except Exception:
-            alive = False
-        if not alive or pane.get("pane_dead") == "1":
-            continue
-
-        title = pane.get("pane_title", "")
-        title_score = 1 if title else 0
-        if title.lower().startswith("opencode"):
-            title_score = 2
-
-        content = _run_capture(["tmux", "capture-pane", "-t", pane_id, "-p"], timeout=5)
-        content_score = 1 if content.strip() else 0
-        current_score = 1 if pane_id == current_pane else 0
-        pid_score = int(pane.get("pane_pid") or "0")
-        scored.append(((title_score, content_score, current_score, pid_score), pane_id))
-
-    if not scored:
-        return None
-
-    scored.sort()
-    return scored[-1][1]
-
-
 def _opencode_db_latest_session() -> tuple[str | None, int]:
     db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
     if not db_path.exists():
@@ -409,14 +354,27 @@ def _handle_opencode_autonew(work_dir: Path, record: dict, provider_entry: dict,
     killed_wrappers = _kill_stale_tasks("opencode", work_dir=str(work_dir))
     killed_askd = _kill_stuck_askd_workers("opencode", work_dir=str(work_dir))
 
-    live_pane = _pick_live_opencode_pane(backend, pane_id) or pane_id
-    if not live_pane:
-        return False, "No live OpenCode pane found"
+    if not pane_id:
+        return False, "No OpenCode pane bound to this project"
+
+    # Strict project isolation: refuse to send /new to a pane whose CWD
+    # does not belong to the calling project. This prevents cross-project
+    # interference where project A's autonew hits project B's pane.
+    cwd_check = getattr(backend, "pane_belongs_to_cwd", None)
+    if callable(cwd_check):
+        try:
+            if not cwd_check(pane_id, str(work_dir)):
+                return False, (
+                    f"Refusing to send /new to pane {pane_id}: "
+                    f"pane does not belong to project {work_dir}"
+                )
+        except Exception:
+            pass
 
     before_sid, before_ts = _opencode_db_latest_session()
 
     try:
-        backend.send_text(live_pane, "/new")
+        backend.send_text(pane_id, "/new")
     except Exception as exc:
         return False, f"Failed to send /new: {exc}"
 
@@ -426,10 +384,10 @@ def _handle_opencode_autonew(work_dir: Path, record: dict, provider_entry: dict,
     if not session_file_path:
         session_file_path = str(work_dir / ".ccb" / ".opencode-session")
     session_file = Path(session_file_path)
-    _update_opencode_session_file(session_file, pane_id=live_pane, opencode_session_id=new_sid or before_sid)
+    _update_opencode_session_file(session_file, pane_id=pane_id, opencode_session_id=new_sid or before_sid)
 
     msg = (
-        f"OpenCode /new sent to {live_pane}; "
+        f"OpenCode /new sent to {pane_id}; "
         f"session_id={'unknown' if not (new_sid or before_sid) else (new_sid or before_sid)}; "
         f"killed_wrappers={killed_wrappers}; killed_askd={killed_askd}"
     )

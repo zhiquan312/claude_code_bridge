@@ -581,26 +581,58 @@ class TmuxBackend(TerminalBackend):
             opt = "@" + opt
         self._tmux_run(["set-option", "-p", "-t", pane_id, opt, value or ""], check=False)
 
+    @staticmethod
+    def _cwd_matches(pane_cwd: str, work_dir: str) -> bool:
+        if not pane_cwd or not work_dir:
+            return False
+        try:
+            from project_id import normalize_work_dir
+            return normalize_work_dir(pane_cwd) == normalize_work_dir(work_dir)
+        except Exception:
+            return False
+
     def find_pane_by_title_marker(self, marker: str, cwd_hint: str = "") -> Optional[str]:
         marker = (marker or "").strip()
         if not marker:
             return None
-        cp = self._tmux_run(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"], capture=True)
+        cp = self._tmux_run(
+            ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}\t#{pane_current_path}"],
+            capture=True,
+        )
         if cp.returncode != 0:
             return None
+        fallback_pid = None
         for line in (cp.stdout or "").splitlines():
             if not line.strip():
                 continue
-            if "\t" in line:
-                pid, title = line.split("\t", 1)
-            else:
-                parts = line.split(" ", 1)
-                pid, title = (parts[0], parts[1] if len(parts) > 1 else "")
+            parts = line.split("\t", 2)
+            pid = parts[0] if len(parts) > 0 else ""
+            title = parts[1] if len(parts) > 1 else ""
+            pane_cwd = parts[2] if len(parts) > 2 else ""
             if (title or "").startswith(marker):
                 pid = pid.strip()
                 if self._looks_like_pane_id(pid):
-                    return pid
-        return None
+                    if cwd_hint and self._cwd_matches(pane_cwd, cwd_hint):
+                        return pid
+                    if fallback_pid is None:
+                        fallback_pid = pid
+        return fallback_pid
+
+    def pane_belongs_to_cwd(self, pane_id: str, work_dir: str) -> bool:
+        if not pane_id:
+            return False
+        cp = self._tmux_run(
+            ["display-message", "-p", "-t", pane_id, "#{pane_current_path}"],
+            capture=True,
+            timeout=1.0,
+        )
+        if cp.returncode != 0:
+            # Can't verify - fail open to avoid breaking existing flows
+            return True
+        pane_cwd = (cp.stdout or "").strip()
+        if not pane_cwd:
+            return True
+        return self._cwd_matches(pane_cwd, work_dir)
 
     def get_pane_content(self, pane_id: str, lines: int = 20) -> Optional[str]:
         if not pane_id:
