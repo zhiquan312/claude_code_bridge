@@ -36,6 +36,10 @@ def _write_log(line: str) -> None:
     write_log(log_path(GASKD_SPEC.log_file_name), line)
 
 
+_NO_REPLY_TIMEOUT_S = float(os.environ.get("CCB_GEMINI_NO_REPLY_TIMEOUT", "30.0"))
+_PROMPT_CHECK_LINES = int(os.environ.get("CCB_GEMINI_PROMPT_CHECK_LINES", "30"))
+
+
 def _is_cancel_text(text: str) -> bool:
     s = (text or "").strip().lower()
     if not s:
@@ -171,55 +175,28 @@ class GeminiAdapter(BaseProviderAdapter):
         state = log_reader.capture_state()
 
         prompt = wrap_gemini_prompt(req.message, task.req_id)
+        prompt_sent_at = time.time()
         backend.send_text(pane_id, prompt)
 
-        # Verify prompt delivery: check pane received the text, retry once if not.
-        # If still not visible after retry, return hard failure (Pain Point #3).
-        # Use 50-line window (not 10) to reduce false negatives from fast-scrolling panes.
+        # Verify prompt delivery: check pane received the text, retry once if not
+        prompt_verified = False
         time.sleep(0.5)
-        _delivery_ok = False
-        _VERIFY_LINES = 50
         try:
-            _pane_text = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
-            if task.req_id in _pane_text:
-                _delivery_ok = True
-            else:
+            _pane_text = backend.get_text(pane_id, lines=_PROMPT_CHECK_LINES) or ""
+            prompt_verified = task.req_id in _pane_text
+            if not prompt_verified:
                 _write_log(f"[WARN] Prompt may not be delivered, retrying send req_id={task.req_id}")
                 backend.send_text(pane_id, prompt)
-                time.sleep(1.0)
-                try:
-                    _pane_text2 = backend.get_text(pane_id, lines=_VERIFY_LINES) or ""
-                    _delivery_ok = task.req_id in _pane_text2
-                except Exception:
-                    pass
-        except Exception as _verify_err:
-            _write_log(f"[WARN] Delivery verification error: {_verify_err}")
-
-        if not _delivery_ok:
-            _write_log(f"[ERROR] Delivery verification failed after retry: req_id={task.req_id}")
-            notify_completion(
-                provider="gemini",
-                output_file=req.output_path,
-                reply="Delivery verification failed: prompt not visible in pane after retry",
-                req_id=task.req_id,
-                done_seen=False,
-                status=COMPLETION_STATUS_FAILED,
-                caller=req.caller,
-                email_req_id=req.email_req_id,
-                email_msg_id=req.email_msg_id,
-                email_from=req.email_from,
-                work_dir=req.work_dir,
-                caller_pane_id=req.caller_pane_id,
-                caller_terminal=req.caller_terminal,
-            )
-            return ProviderResult(
-                exit_code=1,
-                reply="Delivery verification failed: prompt not visible in pane after retry",
-                req_id=task.req_id,
-                session_key=session_key,
-                done_seen=False,
-                status=COMPLETION_STATUS_FAILED,
-            )
+                time.sleep(0.5)
+                _pane_text = backend.get_text(pane_id, lines=_PROMPT_CHECK_LINES) or ""
+                prompt_verified = task.req_id in _pane_text
+                if not prompt_verified:
+                    _write_log(
+                        f"[WARN] Prompt still not visible after retry req_id={task.req_id} "
+                        f"pane={pane_id}"
+                    )
+        except Exception:
+            pass
 
         deadline = None if float(req.timeout_s) < 0.0 else (time.time() + float(req.timeout_s))
         done_seen = False
@@ -293,6 +270,20 @@ class GeminiAdapter(BaseProviderAdapter):
                     break
 
             if not reply:
+                if _NO_REPLY_TIMEOUT_S > 0 and not latest_reply:
+                    no_reply_elapsed = time.time() - prompt_sent_at
+                    if no_reply_elapsed >= _NO_REPLY_TIMEOUT_S:
+                        if prompt_verified:
+                            _write_log(
+                                f"[WARN] Gemini produced no reply within {_NO_REPLY_TIMEOUT_S:.1f}s "
+                                f"after prompt send req_id={task.req_id}"
+                            )
+                        else:
+                            _write_log(
+                                f"[ERROR] Gemini prompt delivery/reply timeout after "
+                                f"{_NO_REPLY_TIMEOUT_S:.1f}s req_id={task.req_id} pane={pane_id}"
+                            )
+                        break
                 continue
             latest_reply = str(reply)
             if is_done_text(latest_reply, task.req_id):
