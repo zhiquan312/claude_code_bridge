@@ -79,26 +79,40 @@ def _visible_line_indices(lines: list[str]) -> set[int]:
     Return the set of line indices that are "visible" for CCB marker parsing.
 
     Lines INSIDE markdown fenced code blocks (``` ... ```), block quotes (>),
-    or indented code blocks (4+ leading spaces) are EXCLUDED. This prevents
-    CCB_BEGIN / CCB_DONE markers that appear inline in Claude chat output
-    (e.g., when Claude is quoting a refusal or demonstrating a template) from
-    being mistakenly parsed as a valid reply for a pending req_id.
+    tab-indented code blocks, or 4-space indented code blocks are EXCLUDED.
+    This prevents CCB_BEGIN / CCB_DONE markers that appear inline in Claude
+    chat output (e.g., when Claude is quoting a refusal or demonstrating a
+    template) from being mistakenly parsed as a valid reply for a pending
+    req_id.
     """
     visible: set[int] = set()
     in_fence = False
     for i, ln in enumerate(lines):
         stripped = ln.lstrip()
-        if stripped.startswith("```"):
+        if stripped.startswith("```") or stripped.startswith("~~~"):
             in_fence = not in_fence
             continue
         if in_fence:
             continue
-        if ln.startswith("    "):  # 4-space indented code block
+        # Indented code block: 4+ spaces OR starts with a tab
+        if ln.startswith("    ") or ln.startswith("\t"):
             continue
         if stripped.startswith(">"):  # markdown block quote
             continue
         visible.add(i)
     return visible
+
+
+def _visible_lines_only(text: str) -> str:
+    """Return `text` with hidden (fenced/indented/quoted) lines blanked out.
+
+    Used as a safety filter before strip_done_text() fallback so hidden markers
+    inside code blocks cannot satisfy a pending req_id via the fallback path.
+    """
+    lines = (text or "").splitlines()
+    visible = _visible_line_indices(lines)
+    out = [ln if i in visible else "" for i, ln in enumerate(lines)]
+    return "\n".join(out)
 
 
 def extract_reply_for_req(text: str, req_id: str) -> str:
@@ -128,8 +142,10 @@ def extract_reply_for_req(text: str, req_id: str) -> str:
     target_idxs = [i for i in done_idxs if target_re.match(lines[i] or "")]
 
     if not target_idxs:
-        # Fallback: keep existing behavior (strip only if the last line matches).
-        return strip_done_text(text, req_id)
+        # Fallback: keep existing strip_done_text behavior but run it on a
+        # VISIBLE-ONLY version of the text so hidden markers inside fenced or
+        # indented blocks cannot satisfy the fallback path.
+        return strip_done_text(_visible_lines_only(text), req_id)
 
     target_i = target_idxs[-1]
     begin_i = None

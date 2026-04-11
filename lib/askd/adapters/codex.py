@@ -98,47 +98,6 @@ def _refresh_binding_if_needed(session: CodexProjectSession, *, force: bool) -> 
         return session.codex_session_path or None, session.codex_session_id or None, False
 
 
-def _wait_codex_pane_ready(backend, pane_id: str, req_id: str) -> None:
-    """
-    Wait for a freshly-started Codex pane to finish booting its MCP servers.
-
-    Symptom: after `tmux respawn-pane -k` + `codex ...` restart, Codex shows
-    `Booting MCP server: codex_apps (Xm Ys)` for up to ~5 minutes before the
-    Agent tool is available. If we dispatch a sub-agent validation task during
-    this window, the sub-agent may report 'This session does not expose a
-    usable Agent tool to me directly' because the MCP server is not ready yet.
-
-    This helper polls the pane text and blocks until the 'Booting MCP server:'
-    banner is gone. Timeout is env-controlled via CCB_CODEX_READY_TIMEOUT
-    (default 30s). If the banner persists past timeout, we proceed anyway --
-    better to fail with a visible error than hang forever.
-    """
-    try:
-        timeout_s = float(os.environ.get("CCB_CODEX_READY_TIMEOUT", "30"))
-    except (TypeError, ValueError):
-        timeout_s = 30.0
-    if timeout_s <= 0:
-        return
-    deadline = time.time() + timeout_s
-    warned = False
-    while time.time() < deadline:
-        try:
-            text = backend.get_text(pane_id, lines=80) or ""
-        except Exception:
-            return  # best effort; don't block real dispatch on introspection failure
-        if "Booting MCP server:" not in text:
-            return
-        if not warned:
-            _write_log(
-                f"[INFO] waiting for codex pane MCP boot req_id={req_id} pane={pane_id}"
-            )
-            warned = True
-        time.sleep(0.5)
-    _write_log(
-        f"[WARN] codex pane still booting MCP server after {timeout_s}s req_id={req_id}"
-    )
-
-
 class CodexAdapter(BaseProviderAdapter):
     """Adapter for Codex (WezTerm) provider."""
 
@@ -221,13 +180,6 @@ class CodexAdapter(BaseProviderAdapter):
             work_dir=Path(session.work_dir),
         )
         state = reader.capture_state()
-
-        # V64: wait for pane to finish booting MCP servers before dispatching.
-        # After a fresh codex start, the codex_apps MCP takes up to 5 minutes to
-        # initialize. Sending a task during boot means the Agent tool may not be
-        # ready when the sub-agent spawns, causing "tool not available" errors.
-        _wait_codex_pane_ready(backend, pane_id, task.req_id)
-
         backend.send_text(pane_id, prompt)
 
         # Verify prompt delivery: check pane received the text, retry once if not

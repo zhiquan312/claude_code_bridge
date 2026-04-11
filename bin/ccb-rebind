@@ -39,7 +39,15 @@ import time
 from pathlib import Path
 
 
-SESSION_ID_RE = re.compile(r"codex resume\s+([0-9a-f][0-9a-f\-]{10,})", re.IGNORECASE)
+# Codex session id format: 36-char UUID (8-4-4-4-12 hex digits separated by hyphens).
+# Earlier versions also used 32-char hex-only ids; accept both.
+SESSION_ID_RE = re.compile(
+    r"codex resume\s+("
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"  # UUID
+    r"|[0-9a-f]{32}"  # legacy hex-only
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _log(msg: str, *, verbose: bool) -> None:
@@ -88,25 +96,53 @@ def _extract_session_id(pane_text: str) -> str | None:
     return matches[-1] if matches else None
 
 
-def _find_codex_pid(pane_pid: str) -> str | None:
-    # Look for the newest codex process whose ancestor is the pane bash.
-    rc, out, _ = _run(["pgrep", "-P", pane_pid])
-    if rc != 0 or not out.strip():
-        return None
-    for child_pid in out.strip().split():
-        # Walk children to find a codex binary
-        rc2, cmd, _ = _run(["ps", "-p", child_pid, "-o", "cmd="])
-        if rc2 == 0 and ("codex" in cmd or "codex-linux-x64" in cmd or "bin/codex" in cmd):
-            return child_pid
-        # Walk one more level for the node -> rust wrapper case
-        rc3, grand, _ = _run(["pgrep", "-P", child_pid])
-        if rc3 == 0 and grand.strip():
-            for g in grand.strip().split():
-                rc4, gcmd, _ = _run(["ps", "-p", g, "-o", "cmd="])
-                if rc4 == 0 and ("codex" in gcmd or "codex-linux-x64" in gcmd):
-                    return g
-    # Fallback: any pgrep child
-    return out.strip().split()[0]
+def _find_codex_pid(pane_pid: str, max_depth: int = 6) -> str | None:
+    """Find the most-specific codex pid under the pane bash.
+
+    Walks the process tree up to ``max_depth`` levels so nvm / node wrapper /
+    shell script wrappers do not hide the real codex binary. Prefers the
+    deepest codex-binary match found.
+    """
+    def _descend(pid: str, depth: int) -> list[str]:
+        if depth <= 0:
+            return []
+        rc, out, _ = _run(["pgrep", "-P", pid])
+        if rc != 0 or not out.strip():
+            return []
+        result: list[str] = []
+        for child in out.strip().split():
+            result.append(child)
+            result.extend(_descend(child, depth - 1))
+        return result
+
+    all_descendants = _descend(pane_pid, max_depth)
+    best: str | None = None
+    best_depth = -1
+    # Second pass to get (pid, cmd, depth) tuples for selection
+    def _walk(pid: str, depth: int) -> None:
+        nonlocal best, best_depth
+        rc, out, _ = _run(["pgrep", "-P", pid])
+        if rc != 0 or not out.strip():
+            return
+        for child in out.strip().split():
+            rc2, cmd, _ = _run(["ps", "-p", child, "-o", "cmd="])
+            if rc2 == 0 and (
+                "codex-linux-x64" in cmd
+                or "@openai/codex" in cmd
+                or "/codex/codex" in cmd
+                or cmd.strip().split(" ", 1)[0].endswith("/codex")
+            ):
+                if depth > best_depth:
+                    best = child
+                    best_depth = depth
+            if depth < max_depth:
+                _walk(child, depth + 1)
+
+    _walk(pane_pid, 1)
+    if best:
+        return best
+    # Fallback: any direct child of the pane bash
+    return all_descendants[0] if all_descendants else None
 
 
 def main() -> int:
@@ -114,7 +150,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="show changes without writing")
     parser.add_argument("--verbose", "-v", action="store_true", help="print progress")
     parser.add_argument("--pane", help="override pane id")
-    parser.add_argument("--retries", type=int, default=5, help="poll attempts for session id")
+    parser.add_argument("--retries", type=int, default=60, help="poll attempts for session id (1s each)")
     args = parser.parse_args()
 
     ccb_dir = _find_ccb_dir(Path.cwd())
@@ -176,16 +212,21 @@ def main() -> int:
         print(json.dumps(changes, indent=2))
         return 0
 
-    # Apply updates
+    # Apply updates atomically via temp-file + rename so a concurrent reader
+    # never sees a half-written session file.
     if old_sid and old_sid != new_sid:
         data["old_codex_session_id"] = old_sid
     data["codex_session_id"] = new_sid
-    # Trigger refresh signal so next Codex ask re-reads the binding
     data["codex_refresh_requested_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    session_file.write_text(json.dumps(data, indent=2) + "\n")
+    tmp_path = session_file.with_suffix(session_file.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2) + "\n")
+    tmp_path.replace(session_file)
 
     if codex_pid_file and new_pid:
-        codex_pid_file.write_text(new_pid)
+        # Write trailing newline to match existing codex.pid conventions
+        pid_tmp = codex_pid_file.with_suffix(codex_pid_file.suffix + ".tmp")
+        pid_tmp.write_text(new_pid + "\n")
+        pid_tmp.replace(codex_pid_file)
 
     print(f"[OK] ccb-rebind: pane={pane_id} session_id={new_sid} pid={new_pid or '?'}")
     return 0

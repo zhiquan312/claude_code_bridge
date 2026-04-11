@@ -505,6 +505,7 @@ def _usage() -> None:
     print("  --foreground            Run in foreground (no nohup/background)", file=sys.stderr)
     print("  --background            Force background mode", file=sys.stderr)
     print("  --no-wrap               Don't wrap with CCB protocol markers", file=sys.stderr)
+    print("  --from LABEL            Caller-intent label (prepended to message as header)", file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -535,6 +536,7 @@ def main(argv: list[str]) -> int:
     no_wrap = False
     foreground_mode = _default_foreground()
     parts: list[str] = []
+    from_label: str = ""
 
     it = iter(argv[2:])
     for token in it:
@@ -563,6 +565,16 @@ def main(argv: list[str]) -> int:
         if token == "--no-wrap":
             no_wrap = True
             continue
+        if token == "--from":
+            try:
+                from_label = str(next(it))
+            except StopIteration:
+                print("[ERROR] --from requires a label string", file=sys.stderr)
+                return EXIT_ERROR
+            continue
+        if token.startswith("--from="):
+            from_label = token.split("=", 1)[1]
+            continue
         parts.append(token)
 
     message = " ".join(parts).strip()
@@ -571,6 +583,15 @@ def main(argv: list[str]) -> int:
     if not message:
         print("[ERROR] Message cannot be empty", file=sys.stderr)
         return EXIT_ERROR
+
+    # V65: --from label is a caller-side brief tag (NOT part of the message body).
+    # It is prepended to the message as a one-line header so providers can see
+    # the caller intent without the label polluting the parsed body. Previously
+    # --from was silently absorbed into `parts`, which made `ask codex --from "X" < file`
+    # treat "--from X" as the message and silently discard stdin. Now --from is a
+    # proper flag and stdin is correctly read when no positional message is given.
+    if from_label:
+        message = f"[from: {from_label}]\n\n{message}"
 
     # Notify mode: sync send, no wait for reply (used for hook notifications)
     if notify_mode:
