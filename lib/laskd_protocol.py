@@ -86,26 +86,51 @@ def _visible_line_indices(lines: list[str]) -> set[int]:
     req_id.
     """
     visible: set[int] = set()
-    # Track WHICH fence opened the block so a ~~~ line inside a ``` fence
-    # (or vice versa) cannot falsely close it. Per CommonMark the closing
-    # fence must use the same character family as the opener.
+    # Track BOTH the fence character family (` vs ~) AND the opener length.
+    # Per CommonMark (§4.5) a closing fence must:
+    #   (a) use the same character as the opener, and
+    #   (b) be at least as long as the opener.
+    # So a ```` (length 4) opener is NOT closed by ``` (length 3), and a
+    # ~~~ line inside a ``` block is not a closer either. Tracking both
+    # properties is required to handle fence-length edge cases correctly.
     fence_char: str | None = None
+    fence_len: int = 0
+
+    def _fence_run_len(s: str, ch: str) -> int:
+        # Count leading run of `ch` after the optional indent that has
+        # already been stripped by the caller.
+        n = 0
+        for c in s:
+            if c == ch:
+                n += 1
+            else:
+                break
+        return n
+
     for i, ln in enumerate(lines):
         stripped = ln.lstrip()
         if fence_char is None:
             if stripped.startswith("```"):
                 fence_char = "`"
+                fence_len = _fence_run_len(stripped, "`")
                 continue
             if stripped.startswith("~~~"):
                 fence_char = "~"
+                fence_len = _fence_run_len(stripped, "~")
                 continue
         else:
-            if fence_char == "`" and stripped.startswith("```"):
-                fence_char = None
-                continue
-            if fence_char == "~" and stripped.startswith("~~~"):
-                fence_char = None
-                continue
+            # Inside an open fence: only a same-family run of length >=
+            # opener length closes it.
+            if stripped.startswith(fence_char * fence_len):
+                run = _fence_run_len(stripped, fence_char)
+                rest = stripped[run:]
+                # A valid closing fence line contains only optional
+                # trailing whitespace after the run. Info strings on a
+                # closing fence are not allowed in CommonMark.
+                if run >= fence_len and rest.strip() == "":
+                    fence_char = None
+                    fence_len = 0
+                    continue
             # Any other line inside an open fence is hidden.
             continue
         # Indented code block: 4+ spaces OR starts with a tab

@@ -68,17 +68,55 @@ def _is_log_stale(preferred: Optional[Path], latest: Optional[Path], threshold_s
     return latest_mtime - preferred_mtime >= threshold_s
 
 
+_BOOT_BANNER = "Booting MCP server:"
+
+
+def _pane_is_currently_booting(tail: str) -> bool:
+    """Decide whether a pane is ACTIVELY booting MCP right now.
+
+    The naive check ("Booting MCP server:" substring match) gives false
+    positives for warm panes that still have old boot text sitting in their
+    scrollback. To avoid that, we find the LAST banner line in `tail` and
+    check whether anything non-trivial has been written AFTER it. If the
+    banner is the latest non-whitespace line on screen, the pane is
+    genuinely still booting; otherwise the banner is stale scrollback and
+    the pane has already moved on.
+    """
+    if _BOOT_BANNER not in tail:
+        return False
+    lines = tail.splitlines()
+    last_banner_idx = -1
+    for i, ln in enumerate(lines):
+        if _BOOT_BANNER in ln:
+            last_banner_idx = i
+    if last_banner_idx < 0:
+        return False
+    # Anything after the last banner line that is not whitespace and not
+    # another banner line means the pane has progressed past boot.
+    for ln in lines[last_banner_idx + 1 :]:
+        s = ln.strip()
+        if not s:
+            continue
+        if _BOOT_BANNER in ln:
+            continue
+        return False
+    return True
+
+
 def _wait_if_mcp_booting(backend, pane_id: str, *, req_id: str) -> None:
     """Targeted readiness check: only waits if the pane is ACTIVELY booting MCP.
 
-    Unlike the old blanket 30s wait, this inspects the pane tail once. If the
-    "Booting MCP server:" banner is visible AND no codex prompt (">") is yet
-    rendered, we poll up to CCB_CODEX_MCP_BOOT_WAIT_SECS seconds (default 90)
-    for the banner to clear. If the banner is not present, we return
-    immediately -- the hot path stays fast for normal traffic.
+    Unlike the old blanket 30s wait, this inspects the pane tail once. If
+    the "Booting MCP server:" banner is CURRENTLY the last meaningful line
+    on screen (not just somewhere in scrollback), we poll up to
+    CCB_CODEX_MCP_BOOT_WAIT_SECS seconds (default 90) for the banner to
+    clear. If the banner is absent, or the pane has progressed past it
+    (any non-whitespace content written after the last banner line), we
+    return immediately -- the hot path stays fast for warm traffic.
 
     This protects askd traffic outside codex-switch from racing a cold MCP
-    boot, without adding latency to warm panes.
+    boot without adding latency to warm panes, even when old boot text is
+    still visible in scrollback.
     """
     try:
         max_wait = float(os.environ.get("CCB_CODEX_MCP_BOOT_WAIT_SECS", "90"))
@@ -86,21 +124,23 @@ def _wait_if_mcp_booting(backend, pane_id: str, *, req_id: str) -> None:
         max_wait = 90.0
     if max_wait <= 0:
         return
+    # Use a short tail so stale banner text far up in scrollback cannot
+    # false-trigger the wait loop.
     try:
-        tail = backend.get_text(pane_id, lines=30) or ""
+        tail = backend.get_text(pane_id, lines=15) or ""
     except Exception:
         return
-    if "Booting MCP server:" not in tail:
+    if not _pane_is_currently_booting(tail):
         return
     _write_log(f"[INFO] codex pane {pane_id} is booting MCP; waiting up to {max_wait:.0f}s req_id={req_id}")
     deadline = time.time() + max_wait
     while time.time() < deadline:
         time.sleep(1.0)
         try:
-            tail = backend.get_text(pane_id, lines=30) or ""
+            tail = backend.get_text(pane_id, lines=15) or ""
         except Exception:
             continue
-        if "Booting MCP server:" not in tail:
+        if not _pane_is_currently_booting(tail):
             _write_log(f"[INFO] codex pane {pane_id} MCP boot cleared req_id={req_id}")
             return
     _write_log(f"[WARN] codex pane {pane_id} MCP still booting after {max_wait:.0f}s; sending anyway req_id={req_id}")
