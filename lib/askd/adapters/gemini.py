@@ -312,14 +312,14 @@ class GeminiAdapter(BaseProviderAdapter):
                         if prompt_verified:
                             _write_log(
                                 f"[WARN] Gemini produced no reply within {_NO_REPLY_TIMEOUT_S:.1f}s "
-                                f"after prompt send req_id={task.req_id}"
+                                f"after prompt send req_id={task.req_id} — continuing to wait"
                             )
                         else:
                             _write_log(
-                                f"[ERROR] Gemini prompt delivery/reply timeout after "
-                                f"{_NO_REPLY_TIMEOUT_S:.1f}s req_id={task.req_id} pane={pane_id}"
+                                f"[WARN] Gemini prompt delivery/reply slow after "
+                                f"{_NO_REPLY_TIMEOUT_S:.1f}s req_id={task.req_id} pane={pane_id} — continuing to wait"
                             )
-                        break
+                        continue
                 continue
             latest_reply = str(reply)
             normalized_reply = normalize_box_wrapped_text(latest_reply)
