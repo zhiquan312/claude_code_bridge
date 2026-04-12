@@ -303,21 +303,73 @@ def _codex_log_identity(log_path: Path | None) -> tuple[str, float]:
 
 def _wait_for_new_codex_log(work_dir: Path, before_path: str, before_mtime: float, timeout_s: float = 15.0) -> Path | None:
     deadline = time.time() + timeout_s
-    latest_seen: Path | None = None
     while time.time() < deadline:
         latest = _codex_latest_log(work_dir)
         if latest:
-            latest_seen = latest
             latest_path, latest_mtime = _codex_log_identity(latest)
             if latest_path != before_path or latest_mtime > before_mtime:
                 return latest
         time.sleep(0.5)
-    return latest_seen
+    # Do NOT return stale latest_seen — let Method 2 (pane parsing) handle it
+    return None
+
+
+def _parse_session_id_from_pane(backend, pane_id: str, timeout_s: float = 12.0) -> str | None:
+    """Poll the pane content for 'codex resume <session-id>' and return the session ID.
+
+    This is more robust than log-file detection after codex-switch, because
+    the pane always shows the session ID in its banner regardless of log timing.
+    """
+    deadline = time.time() + timeout_s
+    seen_ids: list[str] = []
+    while time.time() < deadline:
+        try:
+            import re
+            capture = _run_capture(["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-60"], timeout=3.0)
+            # UUIDs may be split across lines by tmux or codex output wrapping.
+            # Join lines so the regex can match the full UUID.
+            capture_joined = capture.replace("\n", "")
+            # Find ALL 'codex resume <uuid>' lines — the LAST one is the newest session
+            matches = re.findall(r'codex resume ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', capture_joined)
+            if matches:
+                latest = matches[-1]
+                if latest not in seen_ids:
+                    seen_ids.append(latest)
+                # Wait a beat to confirm no newer session is starting
+                if len(seen_ids) >= 1:
+                    return seen_ids[-1]
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return seen_ids[-1] if seen_ids else None
+
+
+def _find_codex_log_by_session_id(session_id: str) -> Path | None:
+    """Find the rollout log file for a given Codex session ID."""
+    if not session_id:
+        return None
+    codex_sessions = Path.home() / ".codex" / "sessions"
+    if not codex_sessions.exists():
+        return None
+    # Session logs are stored as ~/.codex/sessions/YYYY/MM/DD/rollout-*-<session-id>.jsonl
+    for log_file in codex_sessions.rglob(f"*{session_id}*"):
+        if log_file.is_file():
+            return log_file
+    return None
+
+
+def _kill_stale_codex_tasks(work_dir: str) -> int:
+    """Kill stale async codex task processes for this project."""
+    killed = _kill_stale_tasks("codex", work_dir=work_dir, max_age_s=0.0)
+    return killed
 
 
 def _handle_codex_autonew(work_dir: Path, session, backend, pane_id: str) -> tuple[bool, str]:
     # Kill stuck askd workers holding the Codex provider lock
     _kill_stuck_askd_workers("codex", work_dir=str(work_dir))
+
+    # Also kill stale task processes that may hold stale session state
+    stale_killed = _kill_stale_codex_tasks(str(work_dir))
 
     before_log = _codex_latest_log(work_dir)
     before_path, before_mtime = _codex_log_identity(before_log)
@@ -329,6 +381,7 @@ def _handle_codex_autonew(work_dir: Path, session, backend, pane_id: str) -> tup
     except Exception as exc:
         return False, f"Failed to send /new: {exc}"
 
+    # Method 1: Watch for a new log file (fast path)
     new_log = _wait_for_new_codex_log(work_dir, before_path, before_mtime, timeout_s=15.0)
     if new_log:
         try:
@@ -344,9 +397,29 @@ def _handle_codex_autonew(work_dir: Path, session, backend, pane_id: str) -> tup
             f"{session_id or 'unknown-session'}"
         )
 
+    # Method 2 (fallback): Parse session ID directly from the pane content.
+    # This handles the post-codex-switch case where the log file detection
+    # fails because codex-switch already created a new session and log.
+    pane_session_id = _parse_session_id_from_pane(backend, pane_id, timeout_s=12.0)
+    if pane_session_id:
+        # Try to find the corresponding log file
+        log_path = _find_codex_log_by_session_id(pane_session_id)
+        session.update_codex_log_binding(
+            log_path=str(log_path) if log_path else None,
+            session_id=pane_session_id,
+        )
+        session.clear_codex_refresh_request()
+        return True, (
+            f"Codex /new sent to {pane_id}; rebound to "
+            f"{pane_session_id} (from pane, log={'found' if log_path else 'pending'})"
+            + (f"; killed {stale_killed} stale tasks" if stale_killed else "")
+        )
+
+    # Method 3 (last resort): Request refresh and let askd rebind on next request.
     session.request_codex_refresh(clear_binding=True)
     return True, (
         f"Codex /new sent to {pane_id}; waiting for next askd request to rebind session"
+        + (f"; killed {stale_killed} stale tasks" if stale_killed else "")
     )
 
 
