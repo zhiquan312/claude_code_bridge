@@ -18,6 +18,7 @@ class TaskState(enum.Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    INCOMPLETE = "incomplete"
     CANCELLED = "cancelled"
     EXPIRED = "expired"
 
@@ -25,6 +26,7 @@ class TaskState(enum.Enum):
 _TERMINAL = {
     TaskState.COMPLETED,
     TaskState.FAILED,
+    TaskState.INCOMPLETE,
     TaskState.CANCELLED,
     TaskState.EXPIRED,
 }

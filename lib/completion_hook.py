@@ -88,6 +88,7 @@ def should_emit_wrapper_failure_hook(provider: str, req_id: str) -> bool:
         if latest in {
             TaskState.COMPLETED,
             TaskState.FAILED,
+            TaskState.INCOMPLETE,
             TaskState.CANCELLED,
             TaskState.EXPIRED,
         } and completion_already_notified(provider, req_id):

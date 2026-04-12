@@ -16,6 +16,7 @@ from askd.adapters.base import BaseProviderAdapter, ProviderRequest, ProviderRes
 from askd.registry import ProviderRegistry
 from askd_runtime import log_path, random_token, state_file_path, write_log
 from ccb_protocol import make_req_id
+from completion_hook import COMPLETION_STATUS_INCOMPLETE
 from project_id import compute_ccb_project_id
 from provider_health import ProviderHealthManager, CircuitState
 from providers import ProviderDaemonSpec, make_qualified_key, parse_qualified_provider
@@ -267,7 +268,10 @@ class UnifiedAskDaemon:
         elif result and not is_fire_and_forget:
             self.health.record_result(health_key, result.exit_code, result.reply[:200])
             _write_log(f"[RESULT] provider={base_provider} req_id={req_id} exit={result.exit_code} done={result.done_seen}")
-            if result.exit_code == 0:
+            if getattr(result, "status", None) == COMPLETION_STATUS_INCOMPLETE:
+                self.journal.record(req_id, base_provider, TaskState.INCOMPLETE,
+                                    meta={"exit_code": result.exit_code})
+            elif result.exit_code == 0:
                 self.journal.record(req_id, base_provider, TaskState.COMPLETED)
             else:
                 self.journal.record(req_id, base_provider, TaskState.FAILED,

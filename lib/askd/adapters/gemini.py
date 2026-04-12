@@ -37,7 +37,7 @@ def _write_log(line: str) -> None:
     write_log(log_path(GASKD_SPEC.log_file_name), line)
 
 
-_NO_REPLY_TIMEOUT_S = float(os.environ.get("CCB_GEMINI_NO_REPLY_TIMEOUT", "30.0"))
+_NO_REPLY_TIMEOUT_S = float(os.environ.get("CCB_GEMINI_NO_REPLY_TIMEOUT", "300.0"))
 _PROMPT_CHECK_LINES = int(os.environ.get("CCB_GEMINI_PROMPT_CHECK_LINES", "30"))
 _PANE_DONE_CHECK_LINES = int(os.environ.get("CCB_GEMINI_DONE_CHECK_LINES", "80"))
 
@@ -219,6 +219,7 @@ class GeminiAdapter(BaseProviderAdapter):
         done_ms: Optional[int] = None
         latest_reply = ""
         request_cancelled = False
+        no_reply_warned = False
 
         pane_check_interval = float(os.environ.get("CCB_GASKD_PANE_CHECK_INTERVAL", "2.0"))
         last_pane_check = time.time()
@@ -309,17 +310,19 @@ class GeminiAdapter(BaseProviderAdapter):
                             done_seen = True
                             done_ms = _now_ms() - started_ms
                             break
-                        if prompt_verified:
-                            _write_log(
-                                f"[WARN] Gemini produced no reply within {_NO_REPLY_TIMEOUT_S:.1f}s "
-                                f"after prompt send req_id={task.req_id}"
-                            )
-                        else:
-                            _write_log(
-                                f"[ERROR] Gemini prompt delivery/reply timeout after "
-                                f"{_NO_REPLY_TIMEOUT_S:.1f}s req_id={task.req_id} pane={pane_id}"
-                            )
-                        break
+                        if not no_reply_warned:
+                            no_reply_warned = True
+                            if prompt_verified:
+                                _write_log(
+                                    f"[WARN] Gemini produced no reply within {_NO_REPLY_TIMEOUT_S:.1f}s "
+                                    f"after prompt send req_id={task.req_id} — continuing to wait"
+                                )
+                            else:
+                                _write_log(
+                                    f"[WARN] Gemini prompt delivery/reply slow after "
+                                    f"{_NO_REPLY_TIMEOUT_S:.1f}s req_id={task.req_id} pane={pane_id} — continuing to wait"
+                                )
+                        continue
                 continue
             latest_reply = str(reply)
             normalized_reply = normalize_box_wrapped_text(latest_reply)
